@@ -1,4 +1,4 @@
-package com.liamxie.ddprobe.ui.theme
+package com.liamxie.dasherdatacollector.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

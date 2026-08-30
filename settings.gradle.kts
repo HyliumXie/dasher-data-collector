@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DDProbe"
+rootProject.name = "dasher-data-collector"
 include(":app")

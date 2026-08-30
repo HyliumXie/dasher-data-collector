@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">DDProbe</string>
-    <string name="accessibility_service_description">Observe accessibility events for DDProbe debugging.</string>
+    <string name="app_name">dasher-data-collector</string>
+    <string name="accessibility_service_description">Observe accessibility events for dasher-data-collector debugging.</string>
 </resources>

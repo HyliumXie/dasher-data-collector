@@ -1,4 +1,4 @@
-package com.liamxie.ddprobe
+package com.liamxie.dasherdatacollector
 
 import org.junit.Test
 

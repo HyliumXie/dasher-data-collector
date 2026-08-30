@@ -4,13 +4,13 @@ plugins {
 }
 
 android {
-    namespace = "com.liamxie.ddprobe"
+    namespace = "com.liamxie.dasherdatacollector"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.liamxie.ddprobe"
+        applicationId = "com.liamxie.dasherdatacollector"
         minSdk = 24
         targetSdk = 37
         versionCode = 1

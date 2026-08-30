@@ -1,4 +1,4 @@
-package com.liamxie.ddprobe
+package com.liamxie.dasherdatacollector
 
 import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
@@ -388,10 +388,10 @@ class DoorDashAccessibilityService : AccessibilityService() {
     }
 
     private companion object {
-        const val TAG = "DDProbe"
+        const val TAG = "DasherDataCollector"
         const val DOORDASH_PACKAGE_NAME = "com.doordash.driverapp"
         const val DEBOUNCE_MS = 500L
-        const val PROBE_DIRECTORY = "door_dash_probe"
+        const val PROBE_DIRECTORY = "dasher_data_collector"
         const val RAW_DIRECTORY = "raw"
         const val ACCESSIBILITY_TREE_FILE = "accessibility_tree.json"
         const val VISIBLE_TEXT_FILE = "visible_text.txt"

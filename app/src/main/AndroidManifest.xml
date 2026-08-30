@@ -10,12 +10,12 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.DDProbe">
+        android:theme="@style/Theme.DasherDataCollector">
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:theme="@style/Theme.DDProbe"
+            android:theme="@style/Theme.DasherDataCollector"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -35,7 +35,7 @@
 
             <meta-data
                 android:name="android.accessibilityservice"
-                android:resource="@xml/ddprobe_accessibility_service" />
+                android:resource="@xml/dasher_data_collector_accessibility_service" />
         </service>
     </application>
 
