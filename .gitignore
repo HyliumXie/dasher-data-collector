@@ -16,3 +16,11 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Local collector exports and replay/audit artifacts. These may contain
+# sensitive delivery, customer, merchant, location, and earnings data.
+dasher_*/
+dasher_*.tar
+analysis/
+tools/
+.vscode/

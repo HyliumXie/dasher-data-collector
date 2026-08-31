@@ -23,6 +23,10 @@ class DoorDashAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var pendingWindowContentChanged: EventSnapshot? = null
     private var previousContentHash: String? = null
+    private var previousPersistKey: String? = null
+    private var pendingOfferId: String? = null
+    private val activeAssignments = linkedSetOf<String>()
+    private val knownAssignments = linkedMapOf<String, AssignmentState>()
 
     private val savePendingWindowContentChanged = Runnable {
         pendingWindowContentChanged?.let(::processDoorDashEvent)
@@ -82,16 +86,29 @@ class DoorDashAccessibilityService : AccessibilityService() {
         val treeJsonContent = treeJson.toString(2)
         val contentHash = sha256(treeJsonContent + "\n" + visibleTextContent)
         val assignmentId = extractAssignmentId(accessibilityValues)
-        val screenClassification = classifyScreenForRawCollection(visibleText, assignmentId)
+        val analysis = analyzeDoorDashScreen(
+            event = event,
+            visibleText = visibleText,
+            accessibilityValues = accessibilityValues,
+            assignmentId = assignmentId
+        )
 
         Log.d(
             TAG,
-            "Classified state=$screenClassification, assignmentId=${assignmentId ?: "none"}, " +
+            "Classified state=${analysis.stage}, outcome=${analysis.outcome ?: "none"}, " +
+                "assignmentId=${analysis.assignedAssignmentId ?: assignmentId ?: "none"}, " +
                 "nodeCount=${nodeCount.value}, contentHash=$contentHash"
         )
 
-        if (contentHash == previousContentHash) {
+        if (contentHash == previousContentHash || analysis.persistKey == previousPersistKey) {
             Log.d(TAG, "Duplicate DoorDash screen skipped: contentHash=$contentHash")
+            return
+        }
+
+        if (!analysis.shouldPersist) {
+            previousContentHash = contentHash
+            previousPersistKey = analysis.persistKey
+            Log.d(TAG, "Reduced collection skipped: stage=${analysis.stage}, persistKey=${analysis.persistKey}")
             return
         }
 
@@ -101,10 +118,10 @@ class DoorDashAccessibilityService : AccessibilityService() {
             visibleTextContent = visibleTextContent,
             nodeCount = nodeCount.value,
             contentHash = contentHash,
-            assignmentId = assignmentId,
-            screenClassification = screenClassification
+            analysis = analysis
         )
         previousContentHash = contentHash
+        previousPersistKey = analysis.persistKey
     }
 
     private fun saveRawSnapshot(
@@ -113,8 +130,7 @@ class DoorDashAccessibilityService : AccessibilityService() {
         visibleTextContent: String,
         nodeCount: Int,
         contentHash: String,
-        assignmentId: String?,
-        screenClassification: ScreenClassification
+        analysis: ScreenAnalysis
     ) {
         val snapshotDate = Date()
         val snapshotDirectory = File(
@@ -133,14 +149,24 @@ class DoorDashAccessibilityService : AccessibilityService() {
             .put("className", event.className)
             .put("nodeCount", nodeCount)
             .put("contentHash", contentHash)
-            .put("screenClassification", screenClassification.name)
-            .put("assignmentId", assignmentId ?: JSONObject.NULL)
+            .put("screenClassification", analysis.stage.name)
+            .put("stage", analysis.stage.name)
+            .put("outcome", analysis.outcome?.name ?: JSONObject.NULL)
+            .put("outcomeReason", analysis.outcomeReason ?: JSONObject.NULL)
+            .put("assignmentId", analysis.rawAssignmentId ?: JSONObject.NULL)
+            .put("assignedAssignmentId", analysis.assignedAssignmentId ?: JSONObject.NULL)
+            .put("timestampSource", analysis.timestampSource.name)
+            .put("confidence", analysis.confidence.name)
+            .put("buttonTexts", JSONArray(analysis.buttonTexts))
+            .put("offer", analysis.offer?.toJson() ?: JSONObject.NULL)
+            .put("dashTotal", analysis.dashTotal ?: JSONObject.NULL)
+            .put("persistReason", analysis.persistReason)
             .put(
                 "screenshotStatus",
-                if (screenClassification == ScreenClassification.NAVIGATION) {
-                    "skipped_navigation"
-                } else {
+                if (analysis.shouldCaptureScreenshot) {
                     "pending"
+                } else {
+                    "skipped_reduced_collection"
                 }
             )
             .put("screenshotError", JSONObject.NULL)
@@ -148,13 +174,13 @@ class DoorDashAccessibilityService : AccessibilityService() {
 
         Log.d(
             TAG,
-            "Raw DoorDash snapshot saved: classification=$screenClassification, " +
-                "assignmentId=${assignmentId ?: "none"}, " +
+            "DoorDash transition snapshot saved: stage=${analysis.stage}, " +
+                "assignmentId=${analysis.assignedAssignmentId ?: analysis.rawAssignmentId ?: "none"}, " +
                 "path=${snapshotDirectory.absolutePath}, contentHash=$contentHash"
         )
 
-        if (screenClassification == ScreenClassification.NAVIGATION) {
-            Log.d(TAG, "Screenshot skipped for NAVIGATION")
+        if (!analysis.shouldCaptureScreenshot) {
+            Log.d(TAG, "Screenshot skipped: reduced collection stage=${analysis.stage}")
         } else {
             captureScreenshot(snapshotDirectory, metaJson)
         }
@@ -306,34 +332,333 @@ class DoorDashAccessibilityService : AccessibilityService() {
             .put("children", children)
     }
 
-    private fun classifyScreenForRawCollection(
+    private fun analyzeDoorDashScreen(
+        event: EventSnapshot,
         visibleText: List<String>,
+        accessibilityValues: List<String>,
         assignmentId: String?
-    ): ScreenClassification {
-        val normalizedVisibleText = normalizeForMatching(visibleText.joinToString(separator = "\n"))
-        val hasOfferCue = OFFER_CUE_PATTERNS.any { it.containsMatchIn(normalizedVisibleText) }
-        val hasDeliverBy = normalizedVisibleText.contains("deliver by")
-        val hasAccept = ACCEPT_PATTERN.containsMatchIn(normalizedVisibleText)
-        val hasDecline = DECLINE_PATTERN.containsMatchIn(normalizedVisibleText)
-        val hasNewOfferCues = hasOfferCue || hasDeliverBy || hasAccept || hasDecline
-        val hasDeclineConfirm = DECLINE_SURE_PATTERN.containsMatchIn(normalizedVisibleText) ||
-            (DECLINE_OFFER_PATTERN.containsMatchIn(normalizedVisibleText) &&
-                VIEW_OFFER_DETAILS_PATTERN.containsMatchIn(normalizedVisibleText))
+    ): ScreenAnalysis {
+        val text = visibleText.joinToString(separator = "\n")
+        val normalizedText = normalizeForMatching(text)
+        val exactLines = visibleText.map { it.trim() }.filter { it.isNotBlank() }
+        val lowerLines = exactLines.map { it.lowercase(Locale.US) }.toSet()
+        val buttonTexts = extractButtonTexts(accessibilityValues, exactLines)
+        val dashTotal = extractDashTotal(exactLines)
+        val offer = if (isNewOffer(lowerLines, normalizedText)) parseOffer(exactLines, text) else null
+        val rawAssignmentId = assignmentId
+        var stage = ScreenClassification.OTHER
+        var outcome: Outcome? = null
+        var outcomeReason: String? = null
+        var assignedAssignmentId: String? = null
+        var timestampSource = TimestampSource.FIRST_STAGE_SNAPSHOT
+        var confidence = Confidence.MEDIUM
+        var persistReason = "stage_transition"
 
-        if (hasDeclineConfirm) {
-            return ScreenClassification.DECLINE_CONFIRM
+        if (dashTotal != null) {
+            knownAssignments.values.lastOrNull { it.dashTotalBefore == null }?.dashTotalBefore = dashTotal
         }
 
-        if (assignmentId != null && hasOfferCue && hasDeliverBy && hasAccept && hasDecline) {
-            return ScreenClassification.NEW_OFFER_CANDIDATE
+        when {
+            isUnassigned(normalizedText) -> {
+                stage = ScreenClassification.UNASSIGNED
+                outcome = Outcome.UNASSIGNED
+                outcomeReason = "explicit_unassignment"
+                assignedAssignmentId = chooseAssignmentForText(normalizedText)
+                assignedAssignmentId?.let {
+                    knownAssignments[it]?.outcome = Outcome.UNASSIGNED
+                    activeAssignments.remove(it)
+                }
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            isCompletedFull(normalizedText) || isCompletedSummary(normalizedText) -> {
+                stage = ScreenClassification.COMPLETED
+                outcome = Outcome.COMPLETED
+                outcomeReason = if (isCompletedFull(normalizedText)) "pay_breakdown" else "settlement_summary"
+                assignedAssignmentId = chooseActiveAssignmentForCompletion(normalizedText)
+                val pay = parseCompletionPay(exactLines)
+                assignedAssignmentId?.let {
+                    knownAssignments[it]?.apply {
+                        this.outcome = Outcome.COMPLETED
+                        this.finalPay = pay.finalPay
+                        this.dashTotalAfter = dashTotal
+                    }
+                    activeAssignments.remove(it)
+                }
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            isDeclineConfirmation(normalizedText) -> {
+                stage = ScreenClassification.DECLINE_CONFIRMATION
+                assignedAssignmentId = pendingOfferId
+                persistReason = "decline_confirmation_visible"
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            offer != null -> {
+                stage = ScreenClassification.NEW_OFFER
+                assignedAssignmentId = rawAssignmentId
+                rawAssignmentId?.let {
+                    knownAssignments.putIfAbsent(
+                        it,
+                        AssignmentState(
+                            assignmentId = it,
+                            restaurants = offer.restaurants,
+                            expectedPay = offer.expectedPay,
+                            hasTotalWillBeHigher = offer.hasTotalWillBeHigher
+                        )
+                    )
+                    pendingOfferId = it
+                }
+                confidence = Confidence.HIGH
+                persistReason = "new_offer"
+            }
+            isArrived(normalizedText) -> {
+                stage = ScreenClassification.ARRIVED
+                assignedAssignmentId = chooseAssignmentForText(normalizedText) ?: promotePendingIfOnlyCandidate()
+                assignedAssignmentId?.let {
+                    activeAssignments.add(it)
+                    pendingOfferId = null
+                    knownAssignments[it]?.stage = ScreenClassification.ARRIVED
+                }
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            isAccepted(normalizedText) -> {
+                stage = ScreenClassification.ACCEPTED
+                assignedAssignmentId = chooseAssignmentForText(normalizedText) ?: promotePendingIfOnlyCandidate()
+                assignedAssignmentId?.let {
+                    activeAssignments.add(it)
+                    pendingOfferId = null
+                    knownAssignments[it]?.stage = ScreenClassification.ACCEPTED
+                }
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            isPickedUp(normalizedText) -> {
+                stage = ScreenClassification.PICKED_UP
+                assignedAssignmentId = chooseAssignmentForText(normalizedText) ?: activeAssignments.singleOrNull()
+                assignedAssignmentId?.let {
+                    knownAssignments[it]?.stage = ScreenClassification.PICKED_UP
+                }
+                confidence = if (assignedAssignmentId == null) Confidence.LOW else Confidence.MEDIUM
+            }
+            isNavigation(normalizedText) -> {
+                stage = ScreenClassification.NAVIGATION
+                persistReason = "navigation_skipped"
+            }
         }
 
-        val hasNavigationCue = NAVIGATION_PATTERNS.any { it.containsMatchIn(normalizedVisibleText) }
-        if (assignmentId == null && !hasNewOfferCues && hasNavigationCue) {
-            return ScreenClassification.NAVIGATION
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED && stage != ScreenClassification.NEW_OFFER) {
+            timestampSource = TimestampSource.CLICK_EVENT
         }
 
-        return ScreenClassification.OTHER
+        val shouldPersist = shouldPersistStage(stage, confidence)
+        val shouldCaptureScreenshot = shouldCaptureScreenshot(stage, confidence)
+        val assignedState = assignedAssignmentId?.let(knownAssignments::get)
+        val persistKey = listOf(
+            assignedAssignmentId ?: rawAssignmentId ?: "route",
+            stage.name,
+            outcome?.name.orEmpty(),
+            buttonTexts.joinToString(","),
+            offer?.importantKey().orEmpty(),
+            assignedState?.restaurantKey().orEmpty(),
+            dashTotal.orEmpty()
+        ).joinToString("|")
+
+        return ScreenAnalysis(
+            stage = stage,
+            outcome = outcome,
+            outcomeReason = outcomeReason,
+            rawAssignmentId = rawAssignmentId,
+            assignedAssignmentId = assignedAssignmentId,
+            timestampSource = timestampSource,
+            confidence = confidence,
+            buttonTexts = buttonTexts,
+            offer = offer,
+            dashTotal = dashTotal,
+            shouldPersist = shouldPersist,
+            shouldCaptureScreenshot = shouldCaptureScreenshot,
+            persistKey = persistKey,
+            persistReason = persistReason
+        )
+    }
+
+    private fun isNewOffer(lowerLines: Set<String>, normalizedText: String): Boolean =
+        "decline" in lowerLines &&
+            ("accept" in lowerLines || "add to route" in lowerLines) &&
+            MONEY_PATTERN.containsMatchIn(normalizedText) &&
+            MILES_PATTERN.containsMatchIn(normalizedText) &&
+            normalizedText.contains("deliver by")
+
+    private fun isDeclineConfirmation(normalizedText: String): Boolean =
+        DECLINE_SURE_PATTERN.containsMatchIn(normalizedText) ||
+            DECLINE_OFFER_PATTERN.containsMatchIn(normalizedText)
+
+    private fun isAccepted(normalizedText: String): Boolean =
+        normalizedText.contains("arrived at store") &&
+            (normalizedText.contains("pickup from") ||
+                normalizedText.contains("pick up by") ||
+                normalizedText.contains("heading to") ||
+                normalizedText.contains("current dash"))
+
+    private fun isArrived(normalizedText: String): Boolean =
+        ARRIVED_PATTERNS.any { it.containsMatchIn(normalizedText) }
+
+    private fun isPickedUp(normalizedText: String): Boolean =
+        PICKED_UP_STRONG_PATTERNS.any { it.containsMatchIn(normalizedText) }
+
+    private fun isCompletedFull(normalizedText: String): Boolean =
+        normalizedText.contains("this offer") &&
+            (normalizedText.contains("doordash pay") || normalizedText.contains("base pay")) &&
+            normalizedText.contains("customer tips") &&
+            normalizedText.contains("continue dashing")
+
+    private fun isCompletedSummary(normalizedText: String): Boolean =
+        normalizedText.contains("this offer") &&
+            normalizedText.contains("expand") &&
+            normalizedText.contains("continue dashing")
+
+    private fun isUnassigned(normalizedText: String): Boolean =
+        normalizedText.contains("you've been unassigned from this order") ||
+            normalizedText.contains("youve been unassigned from this order") ||
+            Regex("\\bunassign order\\b").containsMatchIn(normalizedText)
+
+    private fun isNavigation(normalizedText: String): Boolean =
+        NAVIGATION_PATTERNS.any { it.containsMatchIn(normalizedText) }
+
+    private fun shouldPersistStage(stage: ScreenClassification, confidence: Confidence): Boolean =
+        when (stage) {
+            ScreenClassification.NEW_OFFER,
+            ScreenClassification.DECLINE_CONFIRMATION,
+            ScreenClassification.ACCEPTED,
+            ScreenClassification.ARRIVED,
+            ScreenClassification.PICKED_UP,
+            ScreenClassification.COMPLETED,
+            ScreenClassification.UNASSIGNED -> true
+            ScreenClassification.OTHER -> confidence == Confidence.LOW
+            ScreenClassification.NAVIGATION -> false
+        }
+
+    private fun shouldCaptureScreenshot(stage: ScreenClassification, confidence: Confidence): Boolean =
+        stage == ScreenClassification.NEW_OFFER ||
+            stage == ScreenClassification.COMPLETED ||
+            stage == ScreenClassification.UNASSIGNED ||
+            confidence == Confidence.LOW
+
+    private fun promotePendingIfOnlyCandidate(): String? {
+        val pending = pendingOfferId ?: return activeAssignments.singleOrNull()
+        activeAssignments.add(pending)
+        pendingOfferId = null
+        return pending
+    }
+
+    private fun chooseAssignmentForText(normalizedText: String): String? {
+        val candidates = (listOfNotNull(pendingOfferId) + activeAssignments).distinct()
+        val compactText = normalizeEntity(normalizedText)
+        val matches = candidates.filter { assignmentId ->
+            knownAssignments[assignmentId]?.restaurants.orEmpty().any { restaurant ->
+                val normalizedRestaurant = normalizeEntity(restaurant)
+                normalizedRestaurant.isNotBlank() && compactText.contains(normalizedRestaurant)
+            }
+        }
+        return when {
+            matches.size == 1 -> matches.first()
+            candidates.size == 1 -> candidates.first()
+            else -> null
+        }
+    }
+
+    private fun chooseActiveAssignmentForCompletion(normalizedText: String): String? {
+        val compactText = normalizeEntity(normalizedText)
+        val matches = activeAssignments.filter { assignmentId ->
+            knownAssignments[assignmentId]?.restaurants.orEmpty().any { restaurant ->
+                val normalizedRestaurant = normalizeEntity(restaurant)
+                normalizedRestaurant.isNotBlank() && compactText.contains(normalizedRestaurant)
+            }
+        }
+        return when {
+            matches.size == 1 -> matches.first()
+            activeAssignments.size == 1 -> activeAssignments.first()
+            else -> null
+        }
+    }
+
+    private fun parseOffer(lines: List<String>, text: String): OfferFields {
+        val restaurants = mutableListOf<String>()
+        lines.forEachIndexed { index, line ->
+            if (line.equals("Pickup", ignoreCase = true) ||
+                line.equals("Retail pickup", ignoreCase = true) ||
+                line.equals("Restaurant Pickup", ignoreCase = true)
+            ) {
+                lines.getOrNull(index + 1)
+                    ?.takeUnless { it.equals("Customer dropoff", ignoreCase = true) }
+                    ?.takeUnless { it.equals("Accept", ignoreCase = true) }
+                    ?.takeUnless { it.equals("Decline", ignoreCase = true) }
+                    ?.let(restaurants::add)
+            }
+        }
+        val lowerLines = lines.map { it.lowercase(Locale.US) }.toSet()
+        val pickupCount = lines.count {
+            it.equals("Pickup", ignoreCase = true) ||
+                it.equals("Retail pickup", ignoreCase = true) ||
+                it.equals("Restaurant Pickup", ignoreCase = true)
+        }
+        val dropoffCount = lines.count { it.equals("Customer dropoff", ignoreCase = true) }
+        val explicitOrders = ORDER_COUNT_PATTERN.find(text)?.groups?.drop(1)?.firstOrNull { it?.value != null }?.value?.toIntOrNull()
+        val isAddToRoute = "add to route" in lowerLines
+        val isBatched = pickupCount > 1 || dropoffCount > 1 || explicitOrders != null
+        return OfferFields(
+            expectedPay = MONEY_PATTERN.find(text)?.value?.replace(" ", "").orEmpty(),
+            miles = MILES_PATTERN.find(text)?.value?.replace("Additional ", "").orEmpty(),
+            deliverBy = DELIVER_BY_PATTERN.find(text)?.groups?.get(1)?.value.orEmpty(),
+            restaurants = restaurants.distinct(),
+            pickupCount = pickupCount,
+            dropoffCount = dropoffCount,
+            estimatedOrderCount = explicitOrders ?: maxOf(pickupCount, dropoffCount, 1),
+            offerType = when {
+                isAddToRoute -> "add_to_route"
+                isBatched -> "batched"
+                else -> "normal"
+            },
+            hasHighPayingOffer = text.contains("high paying offer", ignoreCase = true),
+            hasTotalWillBeHigher = text.contains("total will be higher", ignoreCase = true) ||
+                MONEY_PATTERN.find(text)?.value.orEmpty().contains("+")
+        )
+    }
+
+    private fun parseCompletionPay(lines: List<String>): CompletionPay {
+        val thisOfferIndex = lines.indexOfFirst { it.equals("This offer", ignoreCase = true) }
+        val finalPay = if (thisOfferIndex >= 0) {
+            lines.drop(thisOfferIndex + 1).take(6).firstOrNull { MONEY_PATTERN.matches(it) }.orEmpty()
+        } else {
+            ""
+        }
+        return CompletionPay(finalPay = finalPay)
+    }
+
+    private fun extractDashTotal(lines: List<String>): String? {
+        val index = lines.indexOfFirst {
+            it.equals("This dash", ignoreCase = true) ||
+                it.equals("this dash", ignoreCase = true) ||
+                it.equals("This dash so far", ignoreCase = true)
+        }
+        if (index < 0) return null
+        findMoneyNear(lines, index - 7, index)?.let { return it }
+        return findMoneyNear(lines, index + 1, index + 8)
+    }
+
+    private fun findMoneyNear(lines: List<String>, start: Int, end: Int): String? {
+        val window = lines.subList(start.coerceAtLeast(0), end.coerceAtMost(lines.size))
+        window.firstOrNull { MONEY_PATTERN.matches(it) }?.let { return it }
+        val compact = window.joinToString(separator = "")
+        return MONEY_PATTERN.find(compact)?.value
+    }
+
+    private fun extractButtonTexts(accessibilityValues: List<String>, visibleLines: List<String>): List<String> {
+        val candidates = STAGE_BUTTON_TEXTS.filter { button ->
+            visibleLines.any { it.equals(button, ignoreCase = true) }
+        }
+        return candidates.ifEmpty {
+            accessibilityValues.filter { value ->
+                STAGE_BUTTON_TEXTS.any { it.equals(value, ignoreCase = true) }
+            }
+        }.distinct()
     }
 
     private fun extractAssignmentId(accessibilityValues: List<String>): String? {
@@ -376,11 +701,99 @@ class DoorDashAccessibilityService : AccessibilityService() {
         val className: String
     )
 
+    private data class ScreenAnalysis(
+        val stage: ScreenClassification,
+        val outcome: Outcome?,
+        val outcomeReason: String?,
+        val rawAssignmentId: String?,
+        val assignedAssignmentId: String?,
+        val timestampSource: TimestampSource,
+        val confidence: Confidence,
+        val buttonTexts: List<String>,
+        val offer: OfferFields?,
+        val dashTotal: String?,
+        val shouldPersist: Boolean,
+        val shouldCaptureScreenshot: Boolean,
+        val persistKey: String,
+        val persistReason: String
+    )
+
+    private data class AssignmentState(
+        val assignmentId: String,
+        val restaurants: List<String>,
+        val expectedPay: String,
+        val hasTotalWillBeHigher: Boolean,
+        var stage: ScreenClassification = ScreenClassification.NEW_OFFER,
+        var outcome: Outcome? = null,
+        var finalPay: String = "",
+        var dashTotalBefore: String? = null,
+        var dashTotalAfter: String? = null
+    ) {
+        fun restaurantKey(): String = restaurants.joinToString(separator = ";") { normalizeEntity(it) }
+    }
+
+    private data class OfferFields(
+        val expectedPay: String,
+        val miles: String,
+        val deliverBy: String,
+        val restaurants: List<String>,
+        val pickupCount: Int,
+        val dropoffCount: Int,
+        val estimatedOrderCount: Int,
+        val offerType: String,
+        val hasHighPayingOffer: Boolean,
+        val hasTotalWillBeHigher: Boolean
+    ) {
+        fun importantKey(): String =
+            listOf(expectedPay, miles, deliverBy, restaurants.joinToString(";"), offerType).joinToString("|")
+
+        fun toJson(): JSONObject =
+            JSONObject()
+                .put("expectedPay", expectedPay)
+                .put("miles", miles)
+                .put("deliverBy", deliverBy)
+                .put("restaurants", JSONArray(restaurants))
+                .put("pickupCount", pickupCount)
+                .put("dropoffCount", dropoffCount)
+                .put("estimatedOrderCount", estimatedOrderCount)
+                .put("offerType", offerType)
+                .put("hasHighPayingOffer", hasHighPayingOffer)
+                .put("hasTotalWillBeHigher", hasTotalWillBeHigher)
+    }
+
+    private data class CompletionPay(
+        val finalPay: String
+    )
+
     private enum class ScreenClassification {
-        NEW_OFFER_CANDIDATE,
-        DECLINE_CONFIRM,
+        NEW_OFFER,
+        DECLINE_CONFIRMATION,
+        ACCEPTED,
+        ARRIVED,
+        PICKED_UP,
+        COMPLETED,
+        UNASSIGNED,
         NAVIGATION,
         OTHER
+    }
+
+    private enum class Outcome {
+        COMPLETED,
+        DECLINED,
+        UNASSIGNED,
+        UNKNOWN_OUTCOME
+    }
+
+    private enum class TimestampSource {
+        CLICK_EVENT,
+        FIRST_STAGE_SNAPSHOT,
+        INFERRED_TRANSITION
+    }
+
+    private enum class Confidence {
+        HIGH,
+        MEDIUM,
+        LOW
     }
 
     private class IntCounter {
@@ -399,17 +812,44 @@ class DoorDashAccessibilityService : AccessibilityService() {
         const val SCREENSHOT_FILE = "screenshot.png"
         const val PNG_QUALITY = 100
 
-        val OFFER_CUE_PATTERNS = listOf(
-            Regex("\\bhigh paying offer\\b!?"),
-            Regex("\\bnew offer\\b"),
-            Regex("\\boffer card\\b"),
-            Regex("\\btotal will be higher\\b")
-        )
-        val ACCEPT_PATTERN = Regex("\\baccept\\b")
-        val DECLINE_PATTERN = Regex("\\bdecline\\b")
+        val MONEY_PATTERN = Regex("[+]?\\$\\s*\\d+(?:\\.\\d{2})?\\+?", RegexOption.IGNORE_CASE)
+        val MILES_PATTERN = Regex("(?:additional\\s+)?\\b\\d+(?:\\.\\d+)?\\s*mi\\b", RegexOption.IGNORE_CASE)
+        val DELIVER_BY_PATTERN = Regex("\\bdeliver by\\s+([0-9:]+\\s*[ap]m)\\b", RegexOption.IGNORE_CASE)
+        val ORDER_COUNT_PATTERN = Regex("\\((\\d+)\\s+orders?\\)|\\b(\\d+)\\s+orders\\b", RegexOption.IGNORE_CASE)
         val DECLINE_SURE_PATTERN = Regex("\\bare you sure you want to decline this offer\\b\\??")
         val DECLINE_OFFER_PATTERN = Regex("\\bdecline offer\\b")
-        val VIEW_OFFER_DETAILS_PATTERN = Regex("\\bview offer details\\b")
+        val ARRIVED_PATTERNS = listOf(
+            Regex("\\bstart pickup\\b"),
+            Regex("\\bwaiting for your order\\??\\b"),
+            Regex("\\bverify items\\b"),
+            Regex("\\bscan barcodes\\b"),
+            Regex("\\bcomplete pickup\\b"),
+            Regex("\\ball items scanned\\b")
+        )
+        val PICKED_UP_STRONG_PATTERNS = listOf(
+            Regex("\\bdeliver to\\b"),
+            Regex("\\bdelivery for\\b"),
+            Regex("\\btake photo of drop-off location\\b"),
+            Regex("\\btake photo\\b"),
+            Regex("\\bhanded order to customer\\b"),
+            Regex("\\bhanded order directly to customer\\b"),
+            Regex("\\bcomplete delivery\\b"),
+            Regex("\\bcomplete delivery steps\\b"),
+            Regex("\\bleave it at\\b")
+        )
+        val STAGE_BUTTON_TEXTS = listOf(
+            "Accept",
+            "Add to route",
+            "Decline",
+            "Decline offer",
+            "Arrived at store",
+            "Start pickup",
+            "Verify items",
+            "Scan barcodes",
+            "Complete pickup",
+            "Complete delivery",
+            "Continue dashing"
+        )
         val NAVIGATION_PATTERNS = listOf(
             Regex("\\bturn left\\b"),
             Regex("\\bturn right\\b"),
@@ -435,5 +875,10 @@ class DoorDashAccessibilityService : AccessibilityService() {
         val DATE_DIRECTORY_FORMAT = SimpleDateFormat("yyyyMMdd", Locale.US)
         val SNAPSHOT_DIRECTORY_FORMAT = SimpleDateFormat("HHmmss_SSS", Locale.US)
         val ISO_8601_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US)
+
+        fun normalizeEntity(value: String): String =
+            value
+                .lowercase(Locale.US)
+                .replace(Regex("[^a-z0-9]+"), "")
     }
 }
