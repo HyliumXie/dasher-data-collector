@@ -537,6 +537,9 @@ class DoorDashAccessibilityService : AccessibilityService() {
 
     private fun shouldCaptureScreenshot(stage: ScreenClassification, confidence: Confidence): Boolean =
         stage == ScreenClassification.NEW_OFFER ||
+            stage == ScreenClassification.ACCEPTED ||
+            stage == ScreenClassification.ARRIVED ||
+            stage == ScreenClassification.PICKED_UP ||
             stage == ScreenClassification.COMPLETED ||
             stage == ScreenClassification.UNASSIGNED ||
             confidence == Confidence.LOW

@@ -16,7 +16,7 @@ The collector watches DoorDash accessibility events and persists only useful sta
 - `COMPLETED`
 - `UNASSIGNED`
 
-It skips repeated navigation/map updates and duplicate content hashes. Screenshots are saved only for high-value review cases such as new offers, completion/pay pages, unassignment pages, and low-confidence attribution.
+It skips repeated navigation/map updates and duplicate content hashes. Screenshots are saved for the first useful screen of each main stage, plus unassignment pages and low-confidence attribution.
 
 ## Attribution Rules
 
@@ -45,7 +45,7 @@ Each saved transition may contain:
 - `meta.json`: timestamp, event type, stage, outcome, confidence, timestamp source, assignment id, extracted offer fields, dash total, screenshot status.
 - `visible_text.txt`: visible accessibility text for the saved transition.
 - `accessibility_tree.json`: serialized accessibility node tree.
-- `screenshot.png`: optional screenshot for review/debug cases.
+- `screenshot.png`: screenshot for saved `NEW_OFFER`, `ACCEPTED`, `ARRIVED`, `PICKED_UP`, `COMPLETED`, `UNASSIGNED`, and low-confidence review cases.
 
 ## Build
 
