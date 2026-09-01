@@ -24,3 +24,6 @@ dasher_*.tar
 analysis/
 tools/
 .vscode/
+cleaned/
+dashboard/index.html
+dashboard/assets/

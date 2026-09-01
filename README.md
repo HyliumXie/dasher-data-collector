@@ -2,35 +2,22 @@
 
 Android Accessibility collector for DoorDash Dasher delivery research.
 
-The app records reduced, stage-focused snapshots from `com.doordash.driverapp` so the exported data can be replayed into offer timelines and later used to train an income-optimization model. The model input should come only from the first offer screen; later stages are collected as outcome labels and timing evidence.
+The app records raw, event-driven Accessibility snapshots from `com.doordash.driverapp`. Phone-side collection intentionally stays simple: it preserves original screen evidence, while order reconstruction, stage attribution, batch/add-to-route handling, and model-label generation happen offline after export.
 
 ## What It Collects
 
-The collector watches DoorDash accessibility events and persists only useful state transitions:
+The collector watches DoorDash Accessibility events and saves the current raw node tree for each event. It does not classify screens into delivery stages on the phone.
 
-- `NEW_OFFER`
-- `DECLINE_CONFIRMATION`
-- `ACCEPTED`
-- `ARRIVED`
-- `PICKED_UP`
-- `COMPLETED`
-- `UNASSIGNED`
+Screenshots are captured only when a new `assignmentId` appears on a new-offer screen. This gives one visual audit image for the offer decision while keeping the rest of collection Accessibility-first.
 
-It skips repeated navigation/map updates and duplicate content hashes. Screenshots are saved for the first useful screen of each main stage, plus unassignment pages and low-confidence attribution.
+## Phone-Side Rules
 
-## Attribution Rules
-
-Current production-candidate rules are deterministic and conservative:
-
-- `assignmentId` is used as the offer identity when present on `NEW_OFFER`.
-- Later stages do not depend on `assignmentId`, because today's dataset showed later-stage assignmentId coverage at `0%`.
-- `NEW_OFFER` is detected from `Decline` + `Accept` or `Add to route` + pay + mileage + `Deliver by`.
-- Seeing `Accept` or `Add to route` does not by itself mean the order was accepted.
-- The collector keeps pending and active assignment state in memory, then attributes later stages by restaurant/task context when safe.
-- `Add to route` creates an independent pending assignment and must not overwrite the original active order.
-- `Directions` and `Continue` are supporting signals only, never standalone `PICKED_UP` classifiers.
-- `This dash so far` alone is not completion evidence, but dash-total delta can be used later to recover pay when settlement pages are missing.
-- Missing or ambiguous attribution should stay unknown instead of being forced onto the wrong order.
+- Collection is event-driven only.
+- Every saved event contains the raw `accessibility_tree.json`.
+- Every saved event contains a small `event.json` index with timestamp, Android event type, node count, content hash, and detected `assignmentId` when visible.
+- No `meta.json` or `visible_text.txt` files are produced by the current collector.
+- No stage attribution, completion detection, lateness analysis, or rating analysis happens on the phone.
+- New-offer detection is used only to decide whether to capture a one-time offer screenshot for a newly seen `assignmentId`.
 
 ## Data Output
 
@@ -42,10 +29,19 @@ files/dasher_data_collector/raw/<yyyyMMdd>/<HHmmss_SSS>/
 
 Each saved transition may contain:
 
-- `meta.json`: timestamp, event type, stage, outcome, confidence, timestamp source, assignment id, extracted offer fields, dash total, screenshot status.
-- `visible_text.txt`: visible accessibility text for the saved transition.
 - `accessibility_tree.json`: serialized accessibility node tree.
-- `screenshot.png`: screenshot for saved `NEW_OFFER`, `ACCEPTED`, `ARRIVED`, `PICKED_UP`, `COMPLETED`, `UNASSIGNED`, and low-confidence review cases.
+- `event.json`: timestamp, Android event type, node count, content hash, detected assignment id, and screenshot status.
+- `screenshot.png`: only for the first new-offer screen for a newly seen assignment id.
+
+## Dashboard
+
+A local first-order sample dashboard lives in:
+
+```text
+dashboard/
+```
+
+It currently focuses on the `2026-08-31` Nothing Bundt Cakes / Starbucks sample order and keeps the three-column review layout: order list, offer screenshot, and lifecycle timeline.
 
 ## Build
 
