@@ -1,261 +1,39 @@
 #!/usr/bin/env python3
+import csv
 import json
-import re
-import shutil
-from collections import Counter, defaultdict
-from datetime import datetime
+from collections import Counter
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = ROOT / "dasher_exports" / "dasher_20260831_raw" / "20260831"
+ANALYSIS_DIR = ROOT / "dasher_exports" / "dasher_20260902_analysis_v1"
 OUT = Path(__file__).resolve().parent / "index.html"
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-SAMPLE_ASSIGNMENT_ID = "9f7b7843-9664-4f4e-b55e-9f11aaa34657"
-
-STAGE_ORDER = [
-    "NEW_OFFER",
-    "DECLINE_CONFIRMATION",
-    "ACCEPTED",
-    "ARRIVED",
-    "PICKED_UP",
-    "COMPLETED",
-    "UNASSIGNED",
-]
-
-MAIN_FLOW = ["NEW_OFFER", "ACCEPTED", "ARRIVED", "PICKED_UP", "COMPLETED"]
 
 
-def walk(node):
-    yield node
-    for child in node.get("children") or []:
-        if isinstance(child, dict):
-            yield from walk(child)
+def read_csv(path):
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
-def extract_accessibility(tree):
-    texts = []
-    buttons = []
-    clickable = []
-    for node in walk(tree):
-        text = (node.get("text") or node.get("contentDescription") or "").strip()
-        if not text:
-            continue
-        texts.append(text)
-        class_name = node.get("className") or ""
-        if "Button" in class_name or node.get("clickable"):
-            buttons.append(text)
-        if node.get("clickable"):
-            clickable.append(text)
-    unique_texts = list(dict.fromkeys(texts))
-    unique_buttons = list(dict.fromkeys(buttons))
-    unique_clickable = list(dict.fromkeys(clickable))
+def load_data():
+    sessions = read_csv(ANALYSIS_DIR / "candidate_sessions.csv")
+    summary = json.loads((ANALYSIS_DIR / "summary.json").read_text())
+    label_counts = Counter(row["candidate_label"] for row in sessions)
+    day_counts = Counter(row["day"] for row in sessions)
+    sessions.sort(key=lambda row: (row["day"], row["start_time"], row["candidate_label"]))
     return {
-        "texts": unique_texts,
-        "buttons": unique_buttons,
-        "clickable": unique_clickable,
-        "textPreview": unique_texts[:18],
+        "summary": {
+            "source": str(ANALYSIS_DIR.relative_to(ROOT)),
+            "records": summary["records"],
+            "assignments": summary["unique_assignment_ids"],
+            "sessions": len(sessions),
+            "labelCounts": dict(label_counts),
+            "dayCounts": dict(day_counts),
+            "candidateLabels": summary["candidate_labels"],
+            "gapSeconds": summary["candidate_session_analysis"]["gap_seconds"],
+        },
+        "sessions": sessions,
     }
-
-
-def money_number(value):
-    if not value:
-        return None
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(value).replace(",", ""))
-    return float(match.group(1)) if match else None
-
-
-def duration_minutes(start, end):
-    if not start or not end:
-        return None
-    return round((end - start).total_seconds() / 60, 1)
-
-
-def status_for(stages):
-    has_active = any(stage in stages for stage in ["ACCEPTED", "ARRIVED", "PICKED_UP", "COMPLETED", "UNASSIGNED"])
-    if "COMPLETED" in stages:
-        return "COMPLETED"
-    if "UNASSIGNED" in stages:
-        return "UNASSIGNED"
-    if "DECLINE_CONFIRMATION" in stages and not has_active:
-        return "DECLINED"
-    if "NEW_OFFER" in stages and not has_active:
-        return "TIMEOUT_OR_DECLINED"
-    return "ACCEPTED_INCOMPLETE"
-
-
-def short_id(assignment_id):
-    return assignment_id[:8]
-
-
-def build_data():
-    ASSETS_DIR.mkdir(exist_ok=True)
-    records = []
-    for meta_path in sorted(DATA_ROOT.glob("*/meta.json")):
-        folder = meta_path.parent.name
-        meta = json.loads(meta_path.read_text())
-        tree_path = meta_path.parent / "accessibility_tree.json"
-        tree = json.loads(tree_path.read_text())
-        accessibility = extract_accessibility(tree)
-        timestamp = datetime.fromisoformat(meta["timestamp"])
-        assignment_id = meta.get("assignmentId") or meta.get("assignedAssignmentId")
-        offer = meta.get("offer") or {}
-        records.append(
-            {
-                "folder": folder,
-                "timestamp": meta["timestamp"],
-                "time": timestamp.strftime("%H:%M:%S"),
-                "dt": timestamp,
-                "assignmentId": assignment_id,
-                "stage": meta.get("stage") or meta.get("screenClassification") or "UNKNOWN",
-                "outcome": meta.get("outcome"),
-                "outcomeReason": meta.get("outcomeReason"),
-                "confidence": meta.get("confidence"),
-                "timestampSource": meta.get("timestampSource"),
-                "buttonTexts": meta.get("buttonTexts") or [],
-                "persistReason": meta.get("persistReason"),
-                "expectedPay": offer.get("expectedPay"),
-                "offerPayNumber": money_number(offer.get("expectedPay")),
-                "miles": offer.get("miles"),
-                "deliverBy": offer.get("deliverBy"),
-                "restaurants": offer.get("restaurants") or [],
-                "pickupCount": offer.get("pickupCount"),
-                "dropoffCount": offer.get("dropoffCount"),
-                "estimatedOrderCount": offer.get("estimatedOrderCount"),
-                "offerType": offer.get("offerType"),
-                "hasTotalWillBeHigher": offer.get("hasTotalWillBeHigher"),
-                "dashTotal": meta.get("dashTotal"),
-                "accessibility": accessibility,
-            }
-        )
-    records.sort(key=lambda item: item["dt"])
-
-    grouped = defaultdict(list)
-    for record in records:
-        if record["assignmentId"]:
-            grouped[record["assignmentId"]].append(record)
-
-    orders = []
-    for index, (assignment_id, items) in enumerate(sorted(grouped.items(), key=lambda kv: kv[1][0]["dt"]), 1):
-        counts = Counter(item["stage"] for item in items)
-        first_event_by_stage = {}
-        all_events = []
-        for item in items:
-            event = {
-                key: item[key]
-                for key in [
-                    "folder",
-                    "timestamp",
-                    "time",
-                    "stage",
-                    "outcome",
-                    "outcomeReason",
-                    "confidence",
-                    "timestampSource",
-                    "buttonTexts",
-                    "persistReason",
-                    "dashTotal",
-                    "accessibility",
-                ]
-            }
-            all_events.append(event)
-            if item["stage"] not in first_event_by_stage:
-                first_event_by_stage[item["stage"]] = event
-
-        new_offer_record = next((item for item in items if item["stage"] == "NEW_OFFER"), None)
-        offer_screenshot_folder = None
-        if new_offer_record:
-            source_screenshot = DATA_ROOT / new_offer_record["folder"] / "screenshot.png"
-            if source_screenshot.exists():
-                offer_screenshot_folder = new_offer_record["folder"]
-        stages = set(first_event_by_stage)
-        missing = [stage for stage in MAIN_FLOW if stage not in stages]
-        status = status_for(stages)
-        notes = []
-        if missing:
-            notes.append("missing_stage=" + ",".join(missing))
-        if any(item["confidence"] == "LOW" for item in items):
-            notes.append("has_low_confidence")
-        if counts["NEW_OFFER"] > 1:
-            notes.append("duplicate_new_offer_capture")
-        if counts["ARRIVED"] > 3 or counts["PICKED_UP"] > 3 or counts["ACCEPTED"] > 2:
-            notes.append("duplicate_stage_frames")
-        if "DECLINE_CONFIRMATION" in stages and status not in ["DECLINED", "TIMEOUT_OR_DECLINED"]:
-            notes.append("decline_confirmation_seen_but_later_active")
-        if new_offer_record and new_offer_record.get("hasTotalWillBeHigher"):
-            notes.append("hidden_tip_possible")
-        flow_times = [first_event_by_stage[stage]["timestamp"] for stage in MAIN_FLOW if stage in first_event_by_stage]
-        if flow_times != sorted(flow_times):
-            notes.append("stage_time_order_anomaly")
-
-        timeline = []
-        for stage, event in first_event_by_stage.items():
-            timeline.append(
-                {
-                    "stage": stage,
-                    "time": event["time"],
-                    "timestamp": event["timestamp"],
-                    "folder": event["folder"],
-                    "confidence": event["confidence"],
-                    "timestampSource": event["timestampSource"],
-                    "buttons": event["buttonTexts"],
-                    "accessibilityButtons": event["accessibility"]["buttons"],
-                    "textPreview": event["accessibility"]["textPreview"],
-                    "outcome": event["outcome"],
-                    "outcomeReason": event["outcomeReason"],
-                    "dashTotal": event["dashTotal"],
-                }
-            )
-        timeline.sort(key=lambda event: event["timestamp"])
-
-        orders.append(
-            {
-                "index": index,
-                "assignmentId": assignment_id,
-                "shortId": short_id(assignment_id),
-                "status": status,
-                "firstTime": items[0]["time"],
-                "lastTime": items[-1]["time"],
-                "durationMinutes": duration_minutes(items[0]["dt"], items[-1]["dt"]),
-                "expectedPay": new_offer_record.get("expectedPay") if new_offer_record else None,
-                "miles": new_offer_record.get("miles") if new_offer_record else None,
-                "deliverBy": new_offer_record.get("deliverBy") if new_offer_record else None,
-                "restaurants": new_offer_record.get("restaurants") if new_offer_record else [],
-                "pickupCount": new_offer_record.get("pickupCount") if new_offer_record else None,
-                "dropoffCount": new_offer_record.get("dropoffCount") if new_offer_record else None,
-                "estimatedOrderCount": new_offer_record.get("estimatedOrderCount") if new_offer_record else None,
-                "offerType": new_offer_record.get("offerType") if new_offer_record else None,
-                "hasTotalWillBeHigher": new_offer_record.get("hasTotalWillBeHigher") if new_offer_record else False,
-                "offerScreenshotFolder": offer_screenshot_folder,
-                "offerScreenshot": None,
-                "stageCounts": dict(counts),
-                "missingStages": missing,
-                "notes": notes,
-                "timeline": timeline,
-                "events": all_events,
-            }
-        )
-
-    if SAMPLE_ASSIGNMENT_ID:
-        orders = [order for order in orders if order["assignmentId"] == SAMPLE_ASSIGNMENT_ID]
-
-    for order in orders:
-        if order["offerScreenshotFolder"]:
-            image_name = f"offer_{order['shortId']}.png"
-            source_screenshot = DATA_ROOT / order["offerScreenshotFolder"] / "screenshot.png"
-            shutil.copyfile(source_screenshot, ASSETS_DIR / image_name)
-            order["offerScreenshot"] = f"assets/{image_name}"
-
-    visible_events = [event for order in orders for event in order["events"]]
-    summary = {
-        "date": "2026-08-31",
-        "source": str(DATA_ROOT.relative_to(ROOT)),
-        "orders": len(orders),
-        "events": len(visible_events),
-        "statusCounts": dict(Counter(order["status"] for order in orders)),
-        "stageCounts": dict(Counter(event["stage"] for event in visible_events)),
-    }
-    return {"summary": summary, "orders": orders}
 
 
 def render_html(payload):
@@ -265,7 +43,7 @@ def render_html(payload):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DoorDash Accessibility Timeline</title>
+  <title>DoorDash Candidate Sessions</title>
   <style>
     :root {{
       color-scheme: dark;
@@ -278,7 +56,6 @@ def render_html(payload):
       --accent: #ff5b4f;
       --good: #63d289;
       --warn: #f2bd62;
-      --bad: #ff8f86;
       --blue: #78a7ff;
     }}
     * {{ box-sizing: border-box; }}
@@ -289,22 +66,20 @@ def render_html(payload):
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       letter-spacing: 0;
     }}
-    button, input, select {{
-      font: inherit;
-    }}
+    button, input, select {{ font: inherit; }}
     .app {{
       display: grid;
-      grid-template-columns: 340px minmax(320px, 430px) minmax(0, 1fr);
+      grid-template-columns: 360px 360px minmax(0, 1fr);
       min-height: 100vh;
     }}
-    .sidebar {{
-      border-right: 1px solid #2b2d31;
+    .sidebar, .context {{
       background: #141517;
+      border-right: 1px solid #2b2d31;
+      min-height: 100vh;
       display: flex;
       flex-direction: column;
-      min-height: 100vh;
     }}
-    .side-head {{
+    .head {{
       padding: 22px 20px 16px;
       border-bottom: 1px solid #2b2d31;
     }}
@@ -312,7 +87,7 @@ def render_html(payload):
       color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
-      font-weight: 700;
+      font-weight: 800;
     }}
     h1 {{
       margin: 6px 0 14px;
@@ -330,17 +105,11 @@ def render_html(payload):
       border-radius: 6px;
       padding: 9px;
     }}
-    .stat strong {{
-      display: block;
-      font-size: 17px;
-    }}
-    .stat span {{
-      color: var(--muted);
-      font-size: 11px;
-    }}
+    .stat strong {{ display: block; font-size: 17px; }}
+    .stat span {{ color: var(--muted); font-size: 11px; }}
     .filters {{
       display: grid;
-      grid-template-columns: 1fr 128px;
+      grid-template-columns: 1fr;
       gap: 8px;
       margin-top: 14px;
     }}
@@ -353,14 +122,14 @@ def render_html(payload):
       padding: 10px 11px;
       outline: none;
     }}
-    .order-list {{
+    .list {{
       overflow: auto;
       padding: 10px;
       display: grid;
       gap: 8px;
       align-content: start;
     }}
-    .order-button {{
+    .session-button {{
       appearance: none;
       border: 1px solid #2d2f34;
       background: #1a1b1e;
@@ -370,31 +139,26 @@ def render_html(payload):
       text-align: left;
       cursor: pointer;
     }}
-    .order-button:hover {{
-      border-color: #494c52;
-      background: #202226;
-    }}
-    .order-button.active {{
+    .session-button:hover {{ border-color: #494c52; background: #202226; }}
+    .session-button.active {{
       border-color: var(--accent);
       box-shadow: inset 3px 0 0 var(--accent);
       background: #24201f;
     }}
-    .order-row {{
+    .row {{
       display: flex;
       justify-content: space-between;
       gap: 12px;
       align-items: baseline;
     }}
-    .restaurant {{
+    .label {{
       font-weight: 800;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 220px;
+      max-width: 230px;
     }}
-    .pay {{
-      font-weight: 800;
-    }}
+    .count {{ font-weight: 850; }}
     .meta {{
       margin-top: 6px;
       color: var(--muted);
@@ -403,101 +167,55 @@ def render_html(payload):
       justify-content: space-between;
       gap: 10px;
     }}
-    .status {{
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-      padding: 3px 7px;
+    .pill {{
+      display: inline-flex;
+      align-items: center;
       border-radius: 999px;
       background: #2b2d31;
+      color: #d4d4d1;
+      font-size: 11px;
+      font-weight: 800;
+      padding: 3px 8px;
+      text-transform: uppercase;
+    }}
+    .pill.pickup {{ color: var(--blue); }}
+    .pill.dropoff {{ color: var(--good); }}
+    .pill.payout {{ color: var(--warn); }}
+    .context-body {{ overflow: auto; padding: 20px; }}
+    .context h2, .main h2 {{ margin: 0; font-size: 19px; line-height: 1.25; }}
+    .muted {{ color: var(--muted); }}
+    .section {{ margin-top: 22px; }}
+    .section-title {{
       color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      font-weight: 850;
+      margin-bottom: 8px;
     }}
-    .status.COMPLETED {{ color: var(--good); }}
-    .status.DECLINED {{ color: var(--bad); }}
-    .status.UNASSIGNED {{ color: var(--warn); }}
-    .status.ACCEPTED_INCOMPLETE {{ color: var(--blue); }}
-    .main {{
-      min-width: 0;
-      padding: 34px 36px;
-    }}
-    .offer-pane {{
-      border-right: 1px solid #2b2d31;
-      background: #111214;
-      min-height: 100vh;
-      padding: 24px 20px;
-      overflow: auto;
-    }}
-    .offer-pane-head {{
-      margin-bottom: 14px;
-    }}
-    .offer-pane-head h2 {{
-      margin: 2px 0 4px;
-      font-size: 19px;
-      line-height: 1.25;
-    }}
-    .offer-pane-head div {{
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 700;
-    }}
-    .offer-shot-frame {{
-      background: #070808;
+    .rule-list {{ display: grid; gap: 8px; }}
+    .rule-item {{
+      background: #202124;
       border: 1px solid #303237;
-      border-radius: 8px;
-      padding: 8px;
-    }}
-    .offer-shot {{
-      display: block;
-      width: 100%;
-      height: auto;
       border-radius: 6px;
+      padding: 10px;
     }}
-    .detail {{
-      max-width: 980px;
-      margin: 0 auto;
-    }}
-    .topline {{
-      display: flex;
-      justify-content: space-between;
-      gap: 20px;
-      align-items: flex-start;
-    }}
-    .back {{
-      color: var(--muted);
-      font-size: 34px;
-      line-height: 1;
-      margin-bottom: 22px;
-    }}
+    .rule-item strong {{ display: block; margin-bottom: 4px; }}
+    .main {{ min-width: 0; padding: 34px 36px; }}
+    .detail {{ max-width: 980px; margin: 0 auto; }}
+    .back {{ color: var(--muted); font-size: 34px; line-height: 1; margin-bottom: 22px; }}
     .title {{
       margin: 0;
-      font-size: clamp(32px, 4vw, 52px);
-      line-height: 1.02;
+      font-size: clamp(30px, 4vw, 50px);
+      line-height: 1.04;
       letter-spacing: 0;
     }}
     .subtitle {{
       color: var(--muted);
       margin-top: 10px;
       font-size: 18px;
-      font-weight: 700;
+      font-weight: 750;
     }}
-    .subtitle .hot {{
-      color: var(--accent);
-    }}
-    .order-structure {{
-      margin-top: 18px;
-      display: grid;
-      gap: 6px;
-      color: #dfdfdc;
-      font-size: 18px;
-      line-height: 1.35;
-    }}
-    .order-structure span {{
-      color: var(--muted);
-      font-weight: 800;
-      display: inline-block;
-      min-width: 150px;
-    }}
-    .offer-box {{
+    .summary-grid {{
       background: var(--panel-2);
       border: 1px solid #303237;
       border-radius: 8px;
@@ -507,17 +225,15 @@ def render_html(payload):
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 18px;
     }}
-    .offer-box label {{
+    .summary-grid label {{
       display: block;
       color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
-      font-weight: 800;
+      font-weight: 850;
       margin-bottom: 4px;
     }}
-    .offer-box strong {{
-      font-size: 20px;
-    }}
+    .summary-grid strong {{ font-size: 20px; }}
     .timeline {{
       position: relative;
       margin: 0 0 34px 8px;
@@ -535,11 +251,9 @@ def render_html(payload):
     }}
     .event {{
       position: relative;
-      padding: 0 0 34px 0;
+      padding: 0 0 30px 0;
     }}
-    .event:last-child {{
-      padding-bottom: 0;
-    }}
+    .event:last-child {{ padding-bottom: 0; }}
     .event:before {{
       content: "";
       position: absolute;
@@ -552,40 +266,24 @@ def render_html(payload):
       border: 3px solid var(--bg);
       z-index: 1;
     }}
-    .event.completed:before {{ background: var(--good); }}
-    .event.new_offer:before {{ background: var(--accent); }}
-    .event.declined:before, .event.unassigned:before {{ background: var(--warn); }}
+    .event.start:before {{ background: var(--accent); }}
+    .event.end:before {{ background: var(--good); }}
+    .event.sample:before {{ background: var(--blue); }}
     .event-head {{
       display: flex;
       flex-wrap: wrap;
       gap: 10px 14px;
       align-items: baseline;
     }}
-    .stage {{
-      color: #d8d8d5;
-      font-size: 21px;
-      font-weight: 760;
-    }}
-    .time {{
-      font-size: 28px;
-      font-weight: 900;
-    }}
-    .detail-grid {{
-      margin-top: 9px;
-      display: block;
-      color: var(--muted);
-      font-size: 14px;
-    }}
+    .stage {{ color: #d8d8d5; font-size: 21px; font-weight: 760; }}
+    .time {{ font-size: 28px; font-weight: 900; }}
     .text-preview {{
+      margin-top: 10px;
       color: #d5d5d2;
-      line-height: 1.45;
+      line-height: 1.48;
+      overflow-wrap: anywhere;
     }}
-    .chips {{
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      margin-top: 12px;
-    }}
+    .chips {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }}
     .chip {{
       border: 1px solid #3b3d42;
       color: #d4d4d1;
@@ -593,25 +291,12 @@ def render_html(payload):
       padding: 4px 8px;
       font-size: 12px;
     }}
-    .notes {{
-      margin-top: 28px;
-      color: var(--muted);
-      border-top: 1px solid #303237;
-      padding-top: 18px;
-      font-size: 14px;
-    }}
-    .empty {{
-      color: var(--muted);
-      padding: 28px;
-      text-align: center;
-    }}
-    @media (max-width: 900px) {{
+    .empty {{ color: var(--muted); padding: 28px; text-align: center; }}
+    @media (max-width: 1040px) {{
       .app {{ grid-template-columns: 1fr; }}
-      .sidebar {{ min-height: auto; max-height: 48vh; border-right: 0; border-bottom: 1px solid #2b2d31; }}
-      .offer-pane {{ min-height: auto; border-right: 0; border-bottom: 1px solid #2b2d31; }}
+      .sidebar, .context {{ min-height: auto; max-height: 48vh; border-right: 0; border-bottom: 1px solid #2b2d31; }}
       .main {{ padding: 24px 18px 42px; }}
-      .offer-box {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .detail-grid {{ grid-template-columns: 1fr; }}
+      .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .title {{ font-size: 34px; }}
     }}
   </style>
@@ -619,193 +304,215 @@ def render_html(payload):
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="side-head">
-        <div class="eyebrow">Accessibility Timeline</div>
-        <h1>DoorDash Orders</h1>
+      <div class="head">
+        <div class="eyebrow">Candidate Session Review</div>
+        <h1>DoorDash Sessions</h1>
         <div class="stats">
-          <div class="stat"><strong id="statOrders">0</strong><span>orders</span></div>
-          <div class="stat"><strong id="statEvents">0</strong><span>events</span></div>
-          <div class="stat"><strong id="statDone">0</strong><span>completed</span></div>
+          <div class="stat"><strong id="statSessions">0</strong><span>sessions</span></div>
+          <div class="stat"><strong id="statRecords">0</strong><span>records</span></div>
+          <div class="stat"><strong id="statAssignments">0</strong><span>assignments</span></div>
         </div>
         <div class="filters">
-          <input id="search" placeholder="Search orders">
-          <select id="statusFilter">
-            <option value="ALL">All status</option>
-            <option value="COMPLETED">Completed</option>
-            <option value="DECLINED">Declined</option>
-            <option value="UNASSIGNED">Unassigned</option>
-            <option value="ACCEPTED_INCOMPLETE">Incomplete</option>
-          </select>
+          <input id="search" placeholder="Search session text">
+          <select id="labelFilter"></select>
+          <select id="dayFilter"></select>
         </div>
       </div>
-      <div class="order-list" id="orderList"></div>
+      <div class="list" id="sessionList"></div>
     </aside>
-    <section class="offer-pane" id="offerPane"></section>
+    <section class="context">
+      <div class="head">
+        <div class="eyebrow">Rules</div>
+        <h1>Stage Signals</h1>
+      </div>
+      <div class="context-body" id="contextBody"></div>
+    </section>
     <main class="main">
       <section class="detail" id="detail"></section>
     </main>
   </div>
   <script>
     const DATA = {data_json};
-    const stageLabels = {{
-      NEW_OFFER: "New offer",
-      DECLINE_CONFIRMATION: "Decline confirmation",
-      ACCEPTED: "Offer accepted",
-      ARRIVED: "Arrived at store",
-      PICKED_UP: "Picked up",
-      COMPLETED: "Completed",
-      UNASSIGNED: "Unassigned"
-    }};
-    const stageClass = (stage) => stage.toLowerCase();
-    let selectedId = DATA.orders[0]?.assignmentId;
+    let selectedId = DATA.sessions[0]?.session_id || "";
 
+    const labelNames = {{
+      PICKUP_CANDIDATE: "Pickup",
+      DROPOFF_CANDIDATE: "Dropoff",
+      ARRIVED_STORE_CANDIDATE: "Arrived store",
+      CONFIRM_PICKUP_CANDIDATE: "Confirm pickup",
+      COMPLETE_DELIVERY_CANDIDATE: "Complete delivery",
+      PAYOUT_CANDIDATE: "Payout",
+      UNASSIGN_CANDIDATE: "Unassign",
+      PHOTO_CANDIDATE: "Photo",
+      NAVIGATION_CANDIDATE: "Navigation"
+    }};
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({{
       "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;", "'": "&#39;"
     }}[ch]));
+    const shortTime = (iso) => iso ? new Date(iso).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }}) : "--";
+    const labelClass = (label) => label.replace("_CANDIDATE", "").toLowerCase();
 
-    function restaurantTitle(order) {{
-      if (!order.restaurants || order.restaurants.length === 0) return "Unknown merchant";
-      if (order.restaurants.length === 1) return order.restaurants[0];
-      return `${{order.restaurants[0]}} +${{order.restaurants.length - 1}} other`;
+    function initFilters() {{
+      const labelFilter = document.getElementById("labelFilter");
+      const labels = Object.keys(DATA.summary.labelCounts).sort();
+      labelFilter.innerHTML = `<option value="ALL">All candidate labels</option>` + labels.map((label) =>
+        `<option value="${{esc(label)}}">${{esc(labelNames[label] || label)}} (${{DATA.summary.labelCounts[label]}})</option>`
+      ).join("");
+      const dayFilter = document.getElementById("dayFilter");
+      const days = Object.keys(DATA.summary.dayCounts).sort();
+      dayFilter.innerHTML = `<option value="ALL">All days</option>` + days.map((day) =>
+        `<option value="${{esc(day)}}">${{esc(day)}} (${{DATA.summary.dayCounts[day]}})</option>`
+      ).join("");
     }}
 
-    function orderStructure(order) {{
-      const pickups = order.restaurants || [];
-      const rows = pickups.map((name, index) => `<div><span>Pickup${{index + 1}}:</span>${{esc(name)}}</div>`);
-      rows.push(`<div><span>Customer dropoff:</span>same customer</div>`);
-      return rows.join("");
-    }}
-
-    function renderStats() {{
-      document.getElementById("statOrders").textContent = DATA.summary.orders;
-      document.getElementById("statEvents").textContent = DATA.summary.events;
-      document.getElementById("statDone").textContent = DATA.summary.statusCounts.COMPLETED || 0;
-    }}
-
-    function filteredOrders() {{
+    function filteredSessions() {{
       const query = document.getElementById("search").value.trim().toLowerCase();
-      const status = document.getElementById("statusFilter").value;
-      return DATA.orders.filter((order) => {{
-        const text = [restaurantTitle(order), order.shortId, order.expectedPay, order.miles, order.status].join(" ").toLowerCase();
-        return (status === "ALL" || order.status === status) && (!query || text.includes(query));
+      const label = document.getElementById("labelFilter").value;
+      const day = document.getElementById("dayFilter").value;
+      return DATA.sessions.filter((session) => {{
+        const text = [
+          session.session_id,
+          session.candidate_label,
+          session.merchant_candidates,
+          session.customer_candidates,
+          session.trigger_rules,
+          session.sample_visible_text
+        ].join(" ").toLowerCase();
+        return (label === "ALL" || session.candidate_label === label) &&
+          (day === "ALL" || session.day === day) &&
+          (!query || text.includes(query));
       }});
     }}
 
+    function renderStats() {{
+      document.getElementById("statSessions").textContent = DATA.summary.sessions;
+      document.getElementById("statRecords").textContent = DATA.summary.records;
+      document.getElementById("statAssignments").textContent = DATA.summary.assignments;
+    }}
+
     function renderList() {{
-      const list = document.getElementById("orderList");
-      const orders = filteredOrders();
-      if (!orders.some((order) => order.assignmentId === selectedId)) {{
-        selectedId = orders[0]?.assignmentId;
+      const list = document.getElementById("sessionList");
+      const sessions = filteredSessions();
+      if (!sessions.some((session) => session.session_id === selectedId)) {{
+        selectedId = sessions[0]?.session_id || "";
       }}
-      list.innerHTML = orders.map((order) => `
-        <button class="order-button ${{order.assignmentId === selectedId ? "active" : ""}}" data-id="${{esc(order.assignmentId)}}">
-          <div class="order-row">
-            <div class="restaurant">${{esc(restaurantTitle(order))}}</div>
-            <div class="pay">${{esc(order.expectedPay || "")}}</div>
+      list.innerHTML = sessions.map((session) => `
+        <button class="session-button ${{session.session_id === selectedId ? "active" : ""}}" data-id="${{esc(session.session_id)}}">
+          <div class="row">
+            <div class="label">${{esc(labelNames[session.candidate_label] || session.candidate_label)}}</div>
+            <div class="count">${{esc(session.record_count)}}</div>
           </div>
           <div class="meta">
-            <span>${{esc(order.firstTime)}}-${{esc(order.lastTime)}} · ${{esc(order.miles || "")}}</span>
-            <span class="status ${{esc(order.status)}}">${{esc(order.status.replaceAll("_", " "))}}</span>
+            <span>${{esc(session.day)}} · ${{shortTime(session.start_time)}}</span>
+            <span class="pill ${{labelClass(session.candidate_label)}}">${{esc(session.session_id)}}</span>
           </div>
         </button>
-      `).join("") || `<div class="empty">No matching orders</div>`;
+      `).join("") || `<div class="empty">No matching sessions</div>`;
       list.querySelectorAll("button[data-id]").forEach((button) => {{
         button.addEventListener("click", () => {{
           selectedId = button.dataset.id;
           renderList();
-          renderOfferScreenshot();
           renderDetail();
         }});
       }});
     }}
 
-    function renderOfferScreenshot() {{
-      const order = DATA.orders.find((item) => item.assignmentId === selectedId);
-      const pane = document.getElementById("offerPane");
-      if (!order) {{
-        pane.innerHTML = `<div class="empty">Select an order</div>`;
-        return;
-      }}
-      pane.innerHTML = `
-        <div class="offer-pane-head">
-          <div>Offer screenshot</div>
-          <h2>${{esc(restaurantTitle(order))}}</h2>
-          <div>${{esc(order.expectedPay || "--")}} · ${{esc(order.miles || "--")}}</div>
+    function renderContext() {{
+      const body = document.getElementById("contextBody");
+      const labels = Object.entries(DATA.summary.labelCounts).sort((a, b) => b[1] - a[1]);
+      body.innerHTML = `
+        <h2>${{esc(DATA.summary.source)}}</h2>
+        <div class="muted">Session gap: ${{esc(DATA.summary.gapSeconds)}} seconds</div>
+        <div class="section">
+          <div class="section-title">Counts</div>
+          <div class="rule-list">
+            ${{labels.map(([label, count]) => `<div class="rule-item"><strong>${{esc(labelNames[label] || label)}}</strong><span class="muted">${{count}} sessions · ${{DATA.summary.candidateLabels[label] || 0}} records</span></div>`).join("")}}
+          </div>
         </div>
-        <div class="offer-shot-frame">
-          ${{order.offerScreenshot ? `<img class="offer-shot" src="${{esc(order.offerScreenshot)}}" alt="Offer screenshot for ${{esc(restaurantTitle(order))}}">` : `<div class="empty">No offer screenshot</div>`}}
+        <div class="section">
+          <div class="section-title">Boundary</div>
+          <div class="rule-item">
+            <strong>No order attribution here</strong>
+            <span class="muted">This view only reviews candidate screen sessions. Assignment/order lifecycle attribution comes later.</span>
+          </div>
         </div>
       `;
+    }}
+
+    function booleanChips(session) {{
+      const pairs = [
+        ["Pickup", session.has_pickup_candidate],
+        ["Arrived", session.has_arrived_store_candidate],
+        ["Confirm pickup", session.has_confirm_pickup_candidate],
+        ["Navigation", session.has_navigation_candidate],
+        ["Dropoff", session.has_dropoff_candidate],
+        ["Complete", session.has_complete_delivery_candidate],
+        ["Payout", session.has_payout_candidate],
+        ["Unassign", session.has_unassign_candidate],
+        ["Photo", session.has_photo_candidate]
+      ];
+      return pairs.filter(([, value]) => value === "True" || value === true).map(([label]) => `<span class="chip">${{esc(label)}}</span>`).join("");
     }}
 
     function renderDetail() {{
-      const order = DATA.orders.find((item) => item.assignmentId === selectedId);
+      const session = DATA.sessions.find((item) => item.session_id === selectedId);
       const detail = document.getElementById("detail");
-      if (!order) {{
-        detail.innerHTML = `<div class="empty">Select an order</div>`;
+      if (!session) {{
+        detail.innerHTML = `<div class="empty">Select a session</div>`;
         return;
       }}
-      const notes = order.notes.length ? `<div class="notes"><b>Flags</b><br>${{esc(order.notes.join(" · "))}}</div>` : "";
       detail.innerHTML = `
         <div class="back">←</div>
-        <div class="topline">
-          <div>
-            <h2 class="title">${{esc(restaurantTitle(order))}}</h2>
-            <div class="subtitle">${{esc(DATA.summary.date)}} · <span class="hot">${{esc(order.status.replaceAll("_", " "))}}</span></div>
-            <div class="order-structure">${{orderStructure(order)}}</div>
-          </div>
-          <span class="status ${{esc(order.status)}}">${{esc(order.shortId)}}</span>
-        </div>
-        <div class="offer-box">
-          <div><label>Offer</label><strong>${{esc(order.expectedPay || "--")}}</strong></div>
-          <div><label>Miles</label><strong>${{esc(order.miles || "--")}}</strong></div>
-          <div><label>Deliver by</label><strong>${{esc(order.deliverBy || "--")}}</strong></div>
-          <div><label>Duration</label><strong>${{esc(order.durationMinutes ?? "--")}} min</strong></div>
+        <h2 class="title">${{esc(labelNames[session.candidate_label] || session.candidate_label)}}</h2>
+        <div class="subtitle">${{esc(session.day)}} · ${{esc(session.session_id)}}</div>
+        <div class="summary-grid">
+          <div><label>Records</label><strong>${{esc(session.record_count)}}</strong></div>
+          <div><label>Duration</label><strong>${{Number(session.duration_seconds).toFixed(1)}}s</strong></div>
+          <div><label>Start</label><strong>${{shortTime(session.start_time)}}</strong></div>
+          <div><label>End</label><strong>${{shortTime(session.end_time)}}</strong></div>
         </div>
         <div class="timeline">
-          ${{order.timeline.map((event) => renderEvent(event)).join("")}}
+          <div class="event start">
+            <div class="event-head"><span class="stage">Session started</span><span class="time">${{shortTime(session.start_time)}}</span></div>
+            <div class="text-preview">${{esc(session.first_folder)}}</div>
+          </div>
+          <div class="event sample">
+            <div class="event-head"><span class="stage">Representative screen</span><span class="time">${{esc(session.record_count)}} records</span></div>
+            <div class="chips">${{booleanChips(session)}}</div>
+            <div class="text-preview">${{esc(session.sample_visible_text || "No visible text")}}</div>
+          </div>
+          <div class="event end">
+            <div class="event-head"><span class="stage">Session ended</span><span class="time">${{shortTime(session.end_time)}}</span></div>
+            <div class="text-preview">${{esc(session.last_folder)}}</div>
+          </div>
         </div>
-        ${{notes}}
+        <div class="section">
+          <div class="section-title">Candidates</div>
+          <div class="rule-list">
+            <div class="rule-item"><strong>Merchants</strong><span class="muted">${{esc(session.merchant_candidates || "--")}}</span></div>
+            <div class="rule-item"><strong>Customers</strong><span class="muted">${{esc(session.customer_candidates || "--")}}</span></div>
+            <div class="rule-item"><strong>Trigger rules</strong><span class="muted">${{esc(session.trigger_rules || "--")}}</span></div>
+          </div>
+        </div>
       `;
     }}
 
-    function renderEvent(event) {{
-      const buttons = [...new Set([...(event.buttons || []), ...(event.accessibilityButtons || [])])].slice(0, 10);
-      const textPreview = (event.textPreview || []).slice(0, 12).join(" · ");
-      return `
-        <article class="event ${{stageClass(event.stage)}}">
-          <div class="event-head">
-            <div class="stage">${{esc(stageLabels[event.stage] || event.stage)}}</div>
-            <div class="time">${{esc(event.time)}}</div>
-          </div>
-          <div class="detail-grid">
-            <div class="text-preview">${{esc(textPreview)}}</div>
-          </div>
-          <div class="chips">
-            ${{buttons.map((button) => `<span class="chip">${{esc(button)}}</span>`).join("")}}
-            ${{event.dashTotal ? `<span class="chip">Dash total ${{esc(event.dashTotal)}}</span>` : ""}}
-          </div>
-        </article>
-      `;
-    }}
-
-    document.getElementById("search").addEventListener("input", () => {{ renderList(); renderOfferScreenshot(); renderDetail(); }});
-    document.getElementById("statusFilter").addEventListener("change", () => {{ renderList(); renderOfferScreenshot(); renderDetail(); }});
+    document.getElementById("search").addEventListener("input", renderList);
+    document.getElementById("labelFilter").addEventListener("change", renderList);
+    document.getElementById("dayFilter").addEventListener("change", renderList);
+    initFilters();
     renderStats();
+    renderContext();
     renderList();
-    renderOfferScreenshot();
     renderDetail();
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 def main():
-    payload = build_data()
-    OUT.write_text(render_html(payload))
+    OUT.write_text(render_html(load_data()))
     print(f"Wrote {OUT}")
-    print(json.dumps(payload["summary"], indent=2))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ local.properties
 # sensitive delivery, customer, merchant, location, and earnings data.
 dasher_*/
 dasher_*.tar
+dasher_exports/
 analysis/
 tools/
 .vscode/
