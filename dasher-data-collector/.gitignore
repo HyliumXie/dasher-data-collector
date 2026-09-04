@@ -1,0 +1,30 @@
+*.iml
+.gradle
+.idea/
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/app/build
+/.kotlin
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Local collector exports and replay/audit artifacts. These may contain
+# sensitive delivery, customer, merchant, location, and earnings data.
+dasher_*/
+dasher_*.tar
+dasher_exports/
+analysis/
+tools/
+.vscode/
+cleaned/
+dashboard/index.html
+dashboard/assets/

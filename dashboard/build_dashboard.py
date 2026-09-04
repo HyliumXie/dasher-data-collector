@@ -1,519 +1,161 @@
 #!/usr/bin/env python3
-import csv
-import json
-from collections import Counter
-from pathlib import Path
+"""Local screenshot-first lifecycle annotation server (stdlib only)."""
+from __future__ import annotations
 
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import re
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
-ANALYSIS_DIR = ROOT / "dasher_exports" / "dasher_20260902_analysis_v1"
-OUT = Path(__file__).resolve().parent / "index.html"
+DATA = ROOT / "data"
+ANNOTATIONS = ROOT / "annotations" / "page_labels.jsonl"
+STAGES = ["OFFER", "ADD_TO_ROUTE_OFFER", "DECLINED", "HEADING_TO_PICKUP", "ARRIVED_AT_STORE",
+          "WAITING_FOR_ORDER", "CONFIRM_PICKUP", "PICKED_UP", "HEADING_TO_DROPOFF",
+          "ARRIVED_AT_CUSTOMER", "DROP_OFF", "PHOTO", "COMPLETE_DELIVERY", "COMPLETED",
+          "PAYOUT", "UNASSIGN", "DASH_HOME", "OTHER", "UNKNOWN"]
+CONFIDENCES = ["CERTAIN", "LIKELY", "UNSURE"]
+VOLATILE = re.compile(r"\b(?:\d{1,2}:)?\d{1,2}:\d{2}\b|\b\d+\s*(?:seconds?|secs?|s)\b", re.I)
+_record_cache: tuple[int, list[dict]] | None = None
 
 
-def read_csv(path):
-    with path.open(newline="") as handle:
-        return list(csv.DictReader(handle))
+def safe_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-def load_data():
-    sessions = read_csv(ANALYSIS_DIR / "candidate_sessions.csv")
-    summary = json.loads((ANALYSIS_DIR / "summary.json").read_text())
-    label_counts = Counter(row["candidate_label"] for row in sessions)
-    day_counts = Counter(row["day"] for row in sessions)
-    sessions.sort(key=lambda row: (row["day"], row["start_time"], row["candidate_label"]))
-    return {
-        "summary": {
-            "source": str(ANALYSIS_DIR.relative_to(ROOT)),
-            "records": summary["records"],
-            "assignments": summary["unique_assignment_ids"],
-            "sessions": len(sessions),
-            "labelCounts": dict(label_counts),
-            "dayCounts": dict(day_counts),
-            "candidateLabels": summary["candidate_labels"],
-            "gapSeconds": summary["candidate_session_analysis"]["gap_seconds"],
-        },
-        "sessions": sessions,
-    }
+def flatten_text(node: object) -> list[str]:
+    result: list[str] = []
+    if not isinstance(node, dict): return result
+    for key in ("text", "contentDescription"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip(): result.append(value.strip())
+    for child in node.get("children") or []: result.extend(flatten_text(child))
+    return list(dict.fromkeys(result))
 
 
-def render_html(payload):
-    data_json = json.dumps(payload, ensure_ascii=False)
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DoorDash Candidate Sessions</title>
-  <style>
-    :root {{
-      color-scheme: dark;
-      --bg: #101112;
-      --panel: #18191b;
-      --panel-2: #202124;
-      --line: #424448;
-      --muted: #a8aaad;
-      --text: #f5f5f2;
-      --accent: #ff5b4f;
-      --good: #63d289;
-      --warn: #f2bd62;
-      --blue: #78a7ff;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      letter-spacing: 0;
-    }}
-    button, input, select {{ font: inherit; }}
-    .app {{
-      display: grid;
-      grid-template-columns: 360px 360px minmax(0, 1fr);
-      min-height: 100vh;
-    }}
-    .sidebar, .context {{
-      background: #141517;
-      border-right: 1px solid #2b2d31;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }}
-    .head {{
-      padding: 22px 20px 16px;
-      border-bottom: 1px solid #2b2d31;
-    }}
-    .eyebrow {{
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      font-weight: 800;
-    }}
-    h1 {{
-      margin: 6px 0 14px;
-      font-size: 24px;
-      line-height: 1.15;
-    }}
-    .stats {{
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-    }}
-    .stat {{
-      background: #202124;
-      border: 1px solid #303237;
-      border-radius: 6px;
-      padding: 9px;
-    }}
-    .stat strong {{ display: block; font-size: 17px; }}
-    .stat span {{ color: var(--muted); font-size: 11px; }}
-    .filters {{
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 8px;
-      margin-top: 14px;
-    }}
-    .filters input, .filters select {{
-      width: 100%;
-      border: 1px solid #35373c;
-      background: #111214;
-      color: var(--text);
-      border-radius: 6px;
-      padding: 10px 11px;
-      outline: none;
-    }}
-    .list {{
-      overflow: auto;
-      padding: 10px;
-      display: grid;
-      gap: 8px;
-      align-content: start;
-    }}
-    .session-button {{
-      appearance: none;
-      border: 1px solid #2d2f34;
-      background: #1a1b1e;
-      color: var(--text);
-      border-radius: 6px;
-      padding: 12px;
-      text-align: left;
-      cursor: pointer;
-    }}
-    .session-button:hover {{ border-color: #494c52; background: #202226; }}
-    .session-button.active {{
-      border-color: var(--accent);
-      box-shadow: inset 3px 0 0 var(--accent);
-      background: #24201f;
-    }}
-    .row {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-    }}
-    .label {{
-      font-weight: 800;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 230px;
-    }}
-    .count {{ font-weight: 850; }}
-    .meta {{
-      margin-top: 6px;
-      color: var(--muted);
-      font-size: 12px;
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-    }}
-    .pill {{
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      background: #2b2d31;
-      color: #d4d4d1;
-      font-size: 11px;
-      font-weight: 800;
-      padding: 3px 8px;
-      text-transform: uppercase;
-    }}
-    .pill.pickup {{ color: var(--blue); }}
-    .pill.dropoff {{ color: var(--good); }}
-    .pill.payout {{ color: var(--warn); }}
-    .context-body {{ overflow: auto; padding: 20px; }}
-    .context h2, .main h2 {{ margin: 0; font-size: 19px; line-height: 1.25; }}
-    .muted {{ color: var(--muted); }}
-    .section {{ margin-top: 22px; }}
-    .section-title {{
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      font-weight: 850;
-      margin-bottom: 8px;
-    }}
-    .rule-list {{ display: grid; gap: 8px; }}
-    .rule-item {{
-      background: #202124;
-      border: 1px solid #303237;
-      border-radius: 6px;
-      padding: 10px;
-    }}
-    .rule-item strong {{ display: block; margin-bottom: 4px; }}
-    .main {{ min-width: 0; padding: 34px 36px; }}
-    .detail {{ max-width: 980px; margin: 0 auto; }}
-    .back {{ color: var(--muted); font-size: 34px; line-height: 1; margin-bottom: 22px; }}
-    .title {{
-      margin: 0;
-      font-size: clamp(30px, 4vw, 50px);
-      line-height: 1.04;
-      letter-spacing: 0;
-    }}
-    .subtitle {{
-      color: var(--muted);
-      margin-top: 10px;
-      font-size: 18px;
-      font-weight: 750;
-    }}
-    .summary-grid {{
-      background: var(--panel-2);
-      border: 1px solid #303237;
-      border-radius: 8px;
-      padding: 18px 20px;
-      margin: 28px 0 36px;
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 18px;
-    }}
-    .summary-grid label {{
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      font-weight: 850;
-      margin-bottom: 4px;
-    }}
-    .summary-grid strong {{ font-size: 20px; }}
-    .timeline {{
-      position: relative;
-      margin: 0 0 34px 8px;
-      padding-left: 40px;
-    }}
-    .timeline:before {{
-      content: "";
-      position: absolute;
-      left: 8px;
-      top: 14px;
-      bottom: 14px;
-      width: 4px;
-      border-radius: 2px;
-      background: var(--line);
-    }}
-    .event {{
-      position: relative;
-      padding: 0 0 30px 0;
-    }}
-    .event:last-child {{ padding-bottom: 0; }}
-    .event:before {{
-      content: "";
-      position: absolute;
-      left: -39px;
-      top: 7px;
-      width: 18px;
-      height: 18px;
-      border-radius: 50%;
-      background: #5b5d62;
-      border: 3px solid var(--bg);
-      z-index: 1;
-    }}
-    .event.start:before {{ background: var(--accent); }}
-    .event.end:before {{ background: var(--good); }}
-    .event.sample:before {{ background: var(--blue); }}
-    .event-head {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px 14px;
-      align-items: baseline;
-    }}
-    .stage {{ color: #d8d8d5; font-size: 21px; font-weight: 760; }}
-    .time {{ font-size: 28px; font-weight: 900; }}
-    .text-preview {{
-      margin-top: 10px;
-      color: #d5d5d2;
-      line-height: 1.48;
-      overflow-wrap: anywhere;
-    }}
-    .chips {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }}
-    .chip {{
-      border: 1px solid #3b3d42;
-      color: #d4d4d1;
-      border-radius: 999px;
-      padding: 4px 8px;
-      font-size: 12px;
-    }}
-    .empty {{ color: var(--muted); padding: 28px; text-align: center; }}
-    @media (max-width: 1040px) {{
-      .app {{ grid-template-columns: 1fr; }}
-      .sidebar, .context {{ min-height: auto; max-height: 48vh; border-right: 0; border-bottom: 1px solid #2b2d31; }}
-      .main {{ padding: 24px 18px 42px; }}
-      .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .title {{ font-size: 34px; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="app">
-    <aside class="sidebar">
-      <div class="head">
-        <div class="eyebrow">Candidate Session Review</div>
-        <h1>DoorDash Sessions</h1>
-        <div class="stats">
-          <div class="stat"><strong id="statSessions">0</strong><span>sessions</span></div>
-          <div class="stat"><strong id="statRecords">0</strong><span>records</span></div>
-          <div class="stat"><strong id="statAssignments">0</strong><span>assignments</span></div>
-        </div>
-        <div class="filters">
-          <input id="search" placeholder="Search session text">
-          <select id="labelFilter"></select>
-          <select id="dayFilter"></select>
-        </div>
-      </div>
-      <div class="list" id="sessionList"></div>
-    </aside>
-    <section class="context">
-      <div class="head">
-        <div class="eyebrow">Rules</div>
-        <h1>Stage Signals</h1>
-      </div>
-      <div class="context-body" id="contextBody"></div>
-    </section>
-    <main class="main">
-      <section class="detail" id="detail"></section>
-    </main>
-  </div>
-  <script>
-    const DATA = {data_json};
-    let selectedId = DATA.sessions[0]?.session_id || "";
-
-    const labelNames = {{
-      PICKUP_CANDIDATE: "Pickup",
-      DROPOFF_CANDIDATE: "Dropoff",
-      ARRIVED_STORE_CANDIDATE: "Arrived store",
-      CONFIRM_PICKUP_CANDIDATE: "Confirm pickup",
-      COMPLETE_DELIVERY_CANDIDATE: "Complete delivery",
-      PAYOUT_CANDIDATE: "Payout",
-      UNASSIGN_CANDIDATE: "Unassign",
-      PHOTO_CANDIDATE: "Photo",
-      NAVIGATION_CANDIDATE: "Navigation"
-    }};
-    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({{
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;", "'": "&#39;"
-    }}[ch]));
-    const shortTime = (iso) => iso ? new Date(iso).toLocaleTimeString([], {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }}) : "--";
-    const labelClass = (label) => label.replace("_CANDIDATE", "").toLowerCase();
-
-    function initFilters() {{
-      const labelFilter = document.getElementById("labelFilter");
-      const labels = Object.keys(DATA.summary.labelCounts).sort();
-      labelFilter.innerHTML = `<option value="ALL">All candidate labels</option>` + labels.map((label) =>
-        `<option value="${{esc(label)}}">${{esc(labelNames[label] || label)}} (${{DATA.summary.labelCounts[label]}})</option>`
-      ).join("");
-      const dayFilter = document.getElementById("dayFilter");
-      const days = Object.keys(DATA.summary.dayCounts).sort();
-      dayFilter.innerHTML = `<option value="ALL">All days</option>` + days.map((day) =>
-        `<option value="${{esc(day)}}">${{esc(day)}} (${{DATA.summary.dayCounts[day]}})</option>`
-      ).join("");
-    }}
-
-    function filteredSessions() {{
-      const query = document.getElementById("search").value.trim().toLowerCase();
-      const label = document.getElementById("labelFilter").value;
-      const day = document.getElementById("dayFilter").value;
-      return DATA.sessions.filter((session) => {{
-        const text = [
-          session.session_id,
-          session.candidate_label,
-          session.merchant_candidates,
-          session.customer_candidates,
-          session.trigger_rules,
-          session.sample_visible_text
-        ].join(" ").toLowerCase();
-        return (label === "ALL" || session.candidate_label === label) &&
-          (day === "ALL" || session.day === day) &&
-          (!query || text.includes(query));
-      }});
-    }}
-
-    function renderStats() {{
-      document.getElementById("statSessions").textContent = DATA.summary.sessions;
-      document.getElementById("statRecords").textContent = DATA.summary.records;
-      document.getElementById("statAssignments").textContent = DATA.summary.assignments;
-    }}
-
-    function renderList() {{
-      const list = document.getElementById("sessionList");
-      const sessions = filteredSessions();
-      if (!sessions.some((session) => session.session_id === selectedId)) {{
-        selectedId = sessions[0]?.session_id || "";
-      }}
-      list.innerHTML = sessions.map((session) => `
-        <button class="session-button ${{session.session_id === selectedId ? "active" : ""}}" data-id="${{esc(session.session_id)}}">
-          <div class="row">
-            <div class="label">${{esc(labelNames[session.candidate_label] || session.candidate_label)}}</div>
-            <div class="count">${{esc(session.record_count)}}</div>
-          </div>
-          <div class="meta">
-            <span>${{esc(session.day)}} · ${{shortTime(session.start_time)}}</span>
-            <span class="pill ${{labelClass(session.candidate_label)}}">${{esc(session.session_id)}}</span>
-          </div>
-        </button>
-      `).join("") || `<div class="empty">No matching sessions</div>`;
-      list.querySelectorAll("button[data-id]").forEach((button) => {{
-        button.addEventListener("click", () => {{
-          selectedId = button.dataset.id;
-          renderList();
-          renderDetail();
-        }});
-      }});
-    }}
-
-    function renderContext() {{
-      const body = document.getElementById("contextBody");
-      const labels = Object.entries(DATA.summary.labelCounts).sort((a, b) => b[1] - a[1]);
-      body.innerHTML = `
-        <h2>${{esc(DATA.summary.source)}}</h2>
-        <div class="muted">Session gap: ${{esc(DATA.summary.gapSeconds)}} seconds</div>
-        <div class="section">
-          <div class="section-title">Counts</div>
-          <div class="rule-list">
-            ${{labels.map(([label, count]) => `<div class="rule-item"><strong>${{esc(labelNames[label] || label)}}</strong><span class="muted">${{count}} sessions · ${{DATA.summary.candidateLabels[label] || 0}} records</span></div>`).join("")}}
-          </div>
-        </div>
-        <div class="section">
-          <div class="section-title">Boundary</div>
-          <div class="rule-item">
-            <strong>No order attribution here</strong>
-            <span class="muted">This view only reviews candidate screen sessions. Assignment/order lifecycle attribution comes later.</span>
-          </div>
-        </div>
-      `;
-    }}
-
-    function booleanChips(session) {{
-      const pairs = [
-        ["Pickup", session.has_pickup_candidate],
-        ["Arrived", session.has_arrived_store_candidate],
-        ["Confirm pickup", session.has_confirm_pickup_candidate],
-        ["Navigation", session.has_navigation_candidate],
-        ["Dropoff", session.has_dropoff_candidate],
-        ["Complete", session.has_complete_delivery_candidate],
-        ["Payout", session.has_payout_candidate],
-        ["Unassign", session.has_unassign_candidate],
-        ["Photo", session.has_photo_candidate]
-      ];
-      return pairs.filter(([, value]) => value === "True" || value === true).map(([label]) => `<span class="chip">${{esc(label)}}</span>`).join("");
-    }}
-
-    function renderDetail() {{
-      const session = DATA.sessions.find((item) => item.session_id === selectedId);
-      const detail = document.getElementById("detail");
-      if (!session) {{
-        detail.innerHTML = `<div class="empty">Select a session</div>`;
-        return;
-      }}
-      detail.innerHTML = `
-        <div class="back">←</div>
-        <h2 class="title">${{esc(labelNames[session.candidate_label] || session.candidate_label)}}</h2>
-        <div class="subtitle">${{esc(session.day)}} · ${{esc(session.session_id)}}</div>
-        <div class="summary-grid">
-          <div><label>Records</label><strong>${{esc(session.record_count)}}</strong></div>
-          <div><label>Duration</label><strong>${{Number(session.duration_seconds).toFixed(1)}}s</strong></div>
-          <div><label>Start</label><strong>${{shortTime(session.start_time)}}</strong></div>
-          <div><label>End</label><strong>${{shortTime(session.end_time)}}</strong></div>
-        </div>
-        <div class="timeline">
-          <div class="event start">
-            <div class="event-head"><span class="stage">Session started</span><span class="time">${{shortTime(session.start_time)}}</span></div>
-            <div class="text-preview">${{esc(session.first_folder)}}</div>
-          </div>
-          <div class="event sample">
-            <div class="event-head"><span class="stage">Representative screen</span><span class="time">${{esc(session.record_count)}} records</span></div>
-            <div class="chips">${{booleanChips(session)}}</div>
-            <div class="text-preview">${{esc(session.sample_visible_text || "No visible text")}}</div>
-          </div>
-          <div class="event end">
-            <div class="event-head"><span class="stage">Session ended</span><span class="time">${{shortTime(session.end_time)}}</span></div>
-            <div class="text-preview">${{esc(session.last_folder)}}</div>
-          </div>
-        </div>
-        <div class="section">
-          <div class="section-title">Candidates</div>
-          <div class="rule-list">
-            <div class="rule-item"><strong>Merchants</strong><span class="muted">${{esc(session.merchant_candidates || "--")}}</span></div>
-            <div class="rule-item"><strong>Customers</strong><span class="muted">${{esc(session.customer_candidates || "--")}}</span></div>
-            <div class="rule-item"><strong>Trigger rules</strong><span class="muted">${{esc(session.trigger_rules || "--")}}</span></div>
-          </div>
-        </div>
-      `;
-    }}
-
-    document.getElementById("search").addEventListener("input", renderList);
-    document.getElementById("labelFilter").addEventListener("change", renderList);
-    document.getElementById("dayFilter").addEventListener("change", renderList);
-    initFilters();
-    renderStats();
-    renderContext();
-    renderList();
-    renderDetail();
-  </script>
-</body>
-</html>"""
+def fallback_signature(tree: dict) -> str:
+    text = "\n".join(VOLATILE.sub("<countdown>", part.lower()) for part in flatten_text(tree))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
-def main():
-    OUT.write_text(render_html(load_data()))
-    print(f"Wrote {OUT}")
+def load_labels() -> tuple[dict[str, dict], dict[str, dict]]:
+    by_record: dict[str, dict] = {}; by_signature: dict[str, dict] = {}
+    if not ANNOTATIONS.exists(): return by_record, by_signature
+    for line in ANNOTATIONS.read_text(encoding="utf-8").splitlines():
+        try: label = json.loads(line)
+        except ValueError: continue
+        if label.get("recordId"): by_record[label["recordId"]] = label
+        if label.get("reuseForContentHash") and label.get("contentHash"): by_signature[label["contentHash"]] = label
+    return by_record, by_signature
 
 
-if __name__ == "__main__":
-    main()
+def scan_records() -> list[dict]:
+    global _record_cache
+    by_record, by_signature = load_labels(); records = []
+    if not DATA.exists(): return records
+    label_mtime = ANNOTATIONS.stat().st_mtime_ns if ANNOTATIONS.exists() else 0
+    if _record_cache is not None and _record_cache[0] == label_mtime:
+        return _record_cache[1]
+    labeled_ids = set(by_record)
+    event_paths: list[Path] = []
+    # Screenshot-first: directory enumeration is far cheaper than parsing tens of
+    # thousands of legacy tree-only events. Explicitly labeled tree-only records
+    # remain visible as well.
+    for day in sorted((p for p in DATA.iterdir() if p.is_dir()), key=lambda p: p.name):
+        with os.scandir(day) as entries:
+            for entry in entries:
+                if not entry.is_dir(): continue
+                folder = Path(entry.path); rel = folder.relative_to(DATA).as_posix()
+                has_image = any((folder / name).is_file() for name in ("screenshot.jpg", "screenshot.jpeg", "screenshot.png"))
+                if has_image or rel in labeled_ids: event_paths.append(folder / "event.json")
+    for event_path in sorted(event_paths):
+        folder = event_path.parent; rel = folder.relative_to(DATA).as_posix()
+        event = safe_json(event_path); tree = safe_json(folder / "accessibility_tree.json")
+        screenshot = next((p for p in (folder / "screenshot.jpg", folder / "screenshot.jpeg", folder / "screenshot.png") if p.exists()), None)
+        content_hash = str(event.get("contentHash") or hashlib.sha256(json.dumps(tree, sort_keys=True).encode()).hexdigest())
+        signature = str(event.get("annotationSignature") or fallback_signature(tree))
+        inherited = False; label = by_record.get(rel)
+        if label is None and content_hash in by_signature: label = by_signature[content_hash]; inherited = True
+        records.append({"id": rel, "day": folder.parent.name, "folder": folder.name,
+            "timestamp": event.get("treeCapturedAt") or event.get("timestamp") or "",
+            "contentHash": content_hash, "annotationSignature": signature,
+            "assignmentId": event.get("assignmentId"), "captureType": event.get("captureType", "legacy"),
+            "eventTypeName": event.get("eventTypeName", ""), "hasScreenshot": screenshot is not None,
+            "screenshotUrl": f"/api/screenshot/{rel}" if screenshot else "", "texts": flatten_text(tree)[:80],
+            "label": label, "labelInherited": inherited})
+    _record_cache = (label_mtime, records)
+    return records
+
+
+HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DoorDash Lifecycle Annotation</title><style>
+:root{color-scheme:dark;--bg:#0d0f11;--panel:#17191c;--panel2:#202328;--line:#33373d;--text:#f5f5f2;--muted:#9da2aa;--red:#ff554b;--green:#62d48d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}button,input,select,textarea{font:inherit;color:inherit}.app{height:100vh;display:grid;grid-template-columns:340px minmax(420px,1fr) 330px}.side,.form{background:var(--panel);overflow:auto}.side{border-right:1px solid var(--line)}.form{border-left:1px solid var(--line);padding:18px}.head{position:sticky;top:0;z-index:2;background:#17191cf5;padding:18px;border-bottom:1px solid var(--line)}h1{font-size:20px;margin:2px 0 12px}.stats,.muted{color:var(--muted)}input,select,textarea{width:100%;background:#101215;border:1px solid var(--line);border-radius:7px;padding:10px;margin-top:8px}.list{padding:8px}.item{width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:7px;padding:11px;cursor:pointer}.item:hover{background:var(--panel2)}.item.active{background:#282222;border-color:var(--red)}.item .row,.nav{display:flex;justify-content:space-between;gap:10px}.badge{font-size:11px;padding:2px 6px;border-radius:9px;background:#30343a}.badge.done{color:var(--green)}main{overflow:auto;padding:20px}.viewer{max-width:900px;margin:auto}.shot{display:block;max-width:100%;max-height:68vh;margin:auto;border-radius:10px;box-shadow:0 8px 40px #0008}.empty{padding:80px 20px;text-align:center;color:var(--muted)}.timeline{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin:16px 0}.tick{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:8px;overflow:hidden;cursor:pointer}.tick.current{border-color:var(--red)}.tick span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.field{margin:16px 0}.field label{font-size:12px;text-transform:uppercase;color:var(--muted);font-weight:700}.stagegrid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.stage{margin:0;padding:8px;background:#111316;border:1px solid var(--line);border-radius:6px;cursor:pointer;font-size:11px}.stage.on{background:#592b28;border-color:var(--red)}textarea{height:100px;resize:vertical}.save{background:var(--red);border:0;border-radius:7px;padding:11px;width:100%;font-weight:800;cursor:pointer}.reuse{display:flex;gap:8px;align-items:center;margin:12px 0}.reuse input{width:auto;margin:0}.nav button{background:var(--panel2);border:1px solid var(--line);padding:8px 12px;border-radius:6px}.texts{margin-top:14px;color:#c8cbd0;line-height:1.6}.toast{min-height:20px;color:var(--green);margin-top:10px}@media(max-width:950px){.app{grid-template-columns:260px 1fr}.form{grid-column:1/-1;border:1px solid var(--line)}main{min-height:600px}}
+</style></head><body><div class="app"><aside class="side"><div class="head"><div class="muted">PAGE LABELER</div><h1>DoorDash 生命周期</h1><div id="stats" class="stats"></div><input id="search" placeholder="搜索时间、文本、订单"><select id="filter"><option value="all">全部页面</option><option value="pending">仅待标注</option><option value="done">仅已标注</option><option value="screenshot">仅有截图</option></select></div><div id="list" class="list"></div></aside><main><div id="viewer" class="viewer"></div></main><aside class="form"><div class="nav"><button id="prev">← 上一条</button><button id="next">下一条 →</button></div><div class="field"><label>Stage</label><div id="stages" class="stagegrid"></div></div><div class="field"><label>Confidence</label><select id="confidence"></select></div><div class="field"><label>订单关联提示</label><input id="orderHint" placeholder="assignment / order / merchant"></div><div class="field"><label>Notes</label><textarea id="notes" placeholder="记录判断依据或疑点"></textarea></div><label class="reuse"><input type="checkbox" id="reuse" checked>相同 contentHash 复用标签</label><button id="save" class="save">保存标签 (Ctrl/⌘+S)</button><div id="toast" class="toast"></div></aside></div>
+<script>
+let records=[],shown=[],index=0,stage='UNKNOWN'; const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function init(){let cfg=await fetch('/api/config').then(r=>r.json());records=await fetch('/api/records').then(r=>r.json());$('stages').innerHTML=cfg.stages.map(x=>`<button class="stage" data-stage="${x}">${x}</button>`).join('');$('confidence').innerHTML=cfg.confidences.map(x=>`<option>${x}</option>`).join('');document.querySelectorAll('.stage').forEach(b=>b.onclick=()=>{stage=b.dataset.stage;paintStages()});apply()}
+function apply(){let q=$('search').value.toLowerCase(),f=$('filter').value;shown=records.filter(r=>(!q||JSON.stringify(r).toLowerCase().includes(q))&&(f==='all'||f==='pending'&&!r.label||f==='done'&&r.label||f==='screenshot'&&r.hasScreenshot));index=Math.max(0,Math.min(index,shown.length-1));renderList();render()}
+function renderList(){let done=records.filter(r=>r.label).length;$('stats').textContent=`${done}/${records.length} 已标注 · ${records.filter(r=>r.hasScreenshot).length} 截图`;$('list').innerHTML=shown.map((r,i)=>`<button class="item ${i===index?'active':''}" data-i="${i}"><div class="row"><b>${esc(r.label?.stage||'待标注')}</b><span class="badge ${r.label?'done':''}">${r.hasScreenshot?'截图':'Tree'}</span></div><div class="muted">${esc(r.day)} · ${esc(r.folder)} · ${esc(r.captureType)}</div></button>`).join('')||'<div class="empty">没有记录</div>';document.querySelectorAll('.item').forEach(b=>b.onclick=()=>{index=+b.dataset.i;renderList();render()})}
+function current(){return shown[index]} function go(n){if(shown.length){index=(index+n+shown.length)%shown.length;renderList();render()}}
+function render(){let r=current();if(!r){$('viewer').innerHTML='<div class="empty">请选择页面</div>';return}let label=r.label||{};stage=label.stage||'UNKNOWN';$('confidence').value=label.confidence||'UNSURE';$('notes').value=label.notes||'';$('orderHint').value=label.orderHint||r.assignmentId||'';$('reuse').checked=label.reuseForContentHash!==false;paintStages();let pos=records.findIndex(x=>x.id===r.id),near=records.slice(Math.max(0,pos-2),pos+3);$('viewer').innerHTML=`<div class="timeline">${near.map(x=>`<button class="tick ${x.id===r.id?'current':''}" data-id="${esc(x.id)}"><span>${esc(x.folder)}</span><span class="muted">${esc(x.label?.stage||'—')}</span></button>`).join('')}</div>${r.hasScreenshot?`<img class="shot" src="${r.screenshotUrl}" alt="DoorDash screenshot">`:'<div class="empty">此记录没有截图；可根据 Tree 文本标注</div>'}<div class="texts"><b>${esc(r.id)}</b> · ${esc(r.eventTypeName)}${r.labelInherited?' · 标签由相同 contentHash 复用':''}<br>${r.texts.map(esc).join(' · ')}</div>`;document.querySelectorAll('.tick').forEach(b=>b.onclick=()=>{let j=shown.findIndex(x=>x.id===b.dataset.id);if(j>=0){index=j;renderList();render()}})}
+function paintStages(){document.querySelectorAll('.stage').forEach(b=>b.classList.toggle('on',b.dataset.stage===stage))}
+async function save(){let r=current();if(!r)return;let body={recordId:r.id,contentHash:r.contentHash,annotationSignature:r.annotationSignature,stage,confidence:$('confidence').value,notes:$('notes').value.trim(),orderHint:$('orderHint').value.trim(),reuseForContentHash:$('reuse').checked};let res=await fetch('/api/labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok){$('toast').textContent=await res.text();return}records=await fetch('/api/records').then(x=>x.json());$('toast').textContent='已保存';apply();setTimeout(()=>$('toast').textContent='',1200)}
+$('search').oninput=apply;$('filter').onchange=apply;$('prev').onclick=()=>go(-1);$('next').onclick=()=>go(1);$('save').onclick=save;document.onkeydown=e=>{if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();save()}else if(!/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)&&e.key==='ArrowLeft')go(-1);else if(!/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)&&e.key==='ArrowRight')go(1)};init();
+</script></body></html>'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/": return self.send(200, HTML.encode(), "text/html; charset=utf-8")
+        if path == "/api/config": return self.json(200, {"stages": STAGES, "confidences": CONFIDENCES})
+        if path == "/api/records": return self.json(200, scan_records())
+        if path.startswith("/api/screenshot/"):
+            record_id = unquote(path.removeprefix("/api/screenshot/")); folder = (DATA / record_id).resolve()
+            try: folder.relative_to(DATA.resolve())
+            except ValueError: return self.send(403, b"Forbidden", "text/plain")
+            image = next((p for p in (folder / "screenshot.jpg", folder / "screenshot.jpeg", folder / "screenshot.png") if p.is_file()), None)
+            if image: return self.send(200, image.read_bytes(), mimetypes.guess_type(image.name)[0] or "application/octet-stream")
+        self.send(404, b"Not found", "text/plain")
+
+    def do_POST(self) -> None:
+        if urlparse(self.path).path != "/api/labels": return self.send(404, b"Not found", "text/plain")
+        try:
+            length = int(self.headers.get("Content-Length", "0")); payload = json.loads(self.rfile.read(length))
+            if payload.get("stage") not in STAGES or payload.get("confidence") not in CONFIDENCES: raise ValueError("Invalid stage or confidence")
+            ids = {r["id"] for r in scan_records()}
+            if payload.get("recordId") not in ids: raise ValueError("Unknown recordId")
+            payload["savedAt"] = datetime.now(timezone.utc).isoformat(); payload["schemaVersion"] = 1
+            ANNOTATIONS.parent.mkdir(parents=True, exist_ok=True)
+            with ANNOTATIONS.open("a", encoding="utf-8") as output: output.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.json(200, {"ok": True})
+        except (ValueError, TypeError, json.JSONDecodeError) as error: self.send(400, str(error).encode(), "text/plain; charset=utf-8")
+
+    def json(self, status: int, value: object) -> None: self.send(status, json.dumps(value, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+    def log_message(self, fmt: str, *args: object) -> None: print(f"[{self.log_date_time_string()}] {fmt % args}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(); parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args(); server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"DoorDash labeler: http://{args.host}:{args.port}"); print(f"Data: {DATA}"); print(f"Labels: {ANNOTATIONS}")
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+
+
+if __name__ == "__main__": main()
