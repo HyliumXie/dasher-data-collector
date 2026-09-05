@@ -10,6 +10,7 @@ venv/
 
 # Android / Gradle
 /.gradle-cache/
+/.android-cache/
 .gradle/
 **/build/
 local.properties

@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">dasher-data-collector</string>
-    <string name="accessibility_service_description">Observe accessibility events for dasher-data-collector debugging.</string>
-</resources>
